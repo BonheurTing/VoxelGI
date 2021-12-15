@@ -23,7 +23,27 @@ float RayStepSize; // 0.5  --- < for 100
 Texture3D<uint> VoxelTexAlbedo;
 
 
+
 // Voxelization
+uint EncodeGbuffer(float4 value)
+{
+	uint res = (uint(value.x * 255.f) << 24) + (uint(value.y * 255.f) << 16)
+		+ (uint(value.z * 255.f) << 8) + uint(value.w * 255.f);
+	return res;
+}
+
+float4 DecodeGbuffer(uint value)
+{
+	float4 res = float4(0.f, 0.f, 0.f, 0.f);
+	res.w = (value & 255) / 255.f;
+	value = value >> 8;
+	res.z = (value & 255) / 255.f;
+	value = value >> 8;
+	res.y= (value & 255) / 255.f;
+	value = value >> 8;
+	res.x = (value & 255) / 255.f;
+	return res;
+}
 
 //void mappingAtomicRGBA8Avg()
 
@@ -50,38 +70,24 @@ VoxelizationFsInput VoxelizationVs(VoxelizationVsInput v)
 	o.posH = mul(VoxelizationVP, o.posW);
 	o.uv = v.uv;
 	o.normal = UnityObjectToWorldNormal(v.normal);
-	//o.posH.z = 0.5f;
 	return o;
 }
 
 half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 {
-	float4 posV = mul(WorldToVoxel, i.posW);
-	int3 testuvw = int3(posV.xyz);
-	testuvw.z = 130;
-	OutAlbedo[testuvw] = uint(10);
-
-	return half4(1.f, 0.f, 0.f, 1.0f);
-
-
-
-
 	// pbr
 	float4 albedo = tex2Dlod(ObjAlbedo, float4(i.uv,0,0));
 
+	// calculate the 3d tecture index
+	float4 posV = mul(WorldToVoxel, i.posW);
+	int3 uvw = int3(posV.xyz);
+	OutAlbedo[uvw] = EncodeGbuffer(albedo);
 
-	// location
-	float3 texC = i.posH;
-	texC.xy = (i.posH.xy + float2(1.f,1.f)) / 2.f;
-
-	// calculate the 3d tecture index given the dominant projection axis
-	int3 uvw = texC * VoxelTextureResolution;
+	return half4(1.f, 0.f, 0.f, 1.0f);
 
 	// store the fragment in our 3d texture using a moving average
 	// mappingAtomicRGBA8Avg()
 	//OutAlbedo[uvw] = albedo;
-	
-
 }
 
 // Debug
@@ -115,7 +121,7 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 {
 	float4 accumulatedColor = float4(0.f, 0.f, 0.f, 0.f);
 	float fov = tan(CameraFielfOfView * 3.1415926f / 360.f);
-	float3 rayDirView = float3(fov * CameraAspect * (i.uv.x * 2.0f - 1.0f), fov *  (1.0f - i.uv.y * 2.0f), -1.f);
+	float3 rayDirView = float3(fov * CameraAspect * (i.uv.x * 2.0f - 1.0f), fov *  (i.uv.y * 2.0f - 1.0f), -1.f);
 	float3 rayDirW = normalize(mul((float3x3)CameraInvView, normalize(rayDirView)));
 
 	// float4 posV = mul(CameraInvViewProj, rayPosH)
@@ -126,16 +132,9 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 	{
 		float4 rayWorld = float4(CameraPosW + rayDirW * RayStepSize * i, 1.f);
 		uint3 uvw = mul(WorldToVoxel, rayWorld).xyz; // VoxelTextureResolution;
-		uint texSample = VoxelTexAlbedo[uvw].x;
-		if (texSample > 1)
-		{
-			accumulatedColor.g = 1.f;
-			break;
-		}
+		float4 texSample = DecodeGbuffer(VoxelTexAlbedo[uvw]);
 
-
-		/*
-		if (texSample.a > 0)
+		if (texSample.a > 0.0001f)
 		{
 			accumulatedColor.rgb = accumulatedColor.rgb + (1.f - accumulatedColor.a) * texSample.rgb;
 			accumulatedColor.a = accumulatedColor.a + (1.f - accumulatedColor.a) * texSample.a;
@@ -145,11 +144,6 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 		{
 			break;
 		}
-		*/
 	}
-
-
 	return accumulatedColor;
-
-
 }

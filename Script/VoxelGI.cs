@@ -13,16 +13,13 @@ public class VoxelGI : MonoBehaviour
         EPIVoxelizationDebug
     };
 
-    public Texture2D MainTex = null;
-    public Color AdjustColor;
-
+    // Voxelization Debug
     private Camera RenderCamera;
     private UnityEngine.Rendering.CommandBuffer mCommandBuffer = null;
-    private Camera VoxelizationCamera;
     private Material mGiMaterial;
 
-    // Voxelization Camera
-//     private GameObject VoxelizationCameraObj = null;
+    // Voxelization
+    private Camera VoxelizationCamera;
     public int VoxelTextureResolution = 256;
     public float VoxelSize = 0.25f;
     public float VoxelizationRange
@@ -32,18 +29,30 @@ public class VoxelGI : MonoBehaviour
             return VoxelSize * VoxelTextureResolution;
         }
     }
-    public float RayStepSize = 0.5f;
+    private Vector3 mOrigin
+    {
+        get
+        {
+            Vector3 fixedCameraPos = RenderCamera.transform.position * VoxelSize;
+             Vector3Int intPosition = new Vector3Int((int)fixedCameraPos.x, (int)fixedCameraPos.y, (int)fixedCameraPos.z);
+            intPosition.x = (int)(intPosition.x / VoxelSize);
+            intPosition.y = (int)(intPosition.y / VoxelSize);
+            intPosition.z = (int)(intPosition.z / VoxelSize);
+            return intPosition;
+        }
+    }
+
+    [Range(0.01f, 0.5f)]
+    public float RayStepSize = 0.03f;
 
     private RenderTexture RTSceneColor;
     private int DummyTargetID;
     private RenderTexture DummyTex;
     private RenderTextureDescriptor DummyDesc;
+    private RenderTextureDescriptor mDescriptorGBuffer;
     private RenderTexture UavAlbedo;
-    private RenderTextureDescriptor DescriptorAlbedo;
     private RenderTexture UavNormal;
-    private RenderTextureDescriptor DescriptorNormal;
     private RenderTexture UavEmissive;
-    private RenderTextureDescriptor DescriptorEmissive;
 
     private static Mesh mMesh;
 
@@ -58,11 +67,10 @@ public class VoxelGI : MonoBehaviour
         // Setup.
         RenderCamera = gameObject.GetComponent<Camera>();
         RenderCamera.depthTextureMode = DepthTextureMode.Depth | DepthTextureMode.DepthNormals | DepthTextureMode.MotionVectors;
-        var sd = Shader.Find("Hidden/VoxelGI");
-        mGiMaterial = new Material(sd);
+        mGiMaterial = new Material(Shader.Find("Hidden/VoxelGI"));
 
         BuildCamera();
-        BuildUavAndDescripters();
+        BuildDescripters();
 
         if (mCommandBuffer == null)
         {
@@ -81,6 +89,8 @@ public class VoxelGI : MonoBehaviour
         {
             RenderCamera.AddCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, mCommandBuffer);
         }
+
+        BuildResources();
     }
 
     void OnPreRender()
@@ -89,11 +99,11 @@ public class VoxelGI : MonoBehaviour
 
         if (mCommandBuffer != null)
         {
-            //             BeforeVoxelization();
-            //             EndVoxelization();
-            
+//             BeforeVoxelization();
+//             EndVoxelization();
             BeginRender();
-            Render();
+            RenderVoxel();
+            RenderDebug();
             EndRender();
         }
     }
@@ -104,16 +114,12 @@ public class VoxelGI : MonoBehaviour
         {
             RenderCamera.RemoveCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, mCommandBuffer);
         }
+
+        ReleaseResources();
     }
 
     void OnDestroy()
     {
-        // Release render textures.
-        RenderTexture.ReleaseTemporary(RTSceneColor);
-        // #todo : release rt resources here.
-        UavAlbedo.DiscardContents();
-        UavAlbedo.Release();
-
         if (mCommandBuffer != null)
         {
             mCommandBuffer.Dispose();
@@ -132,11 +138,12 @@ public class VoxelGI : MonoBehaviour
 
     #region Util
 
+
     public Matrix4x4 voxelToWorld
     {
         get
         {
-            var origin = RenderCamera.transform.position - new Vector3(VoxelizationRange, VoxelizationRange, VoxelizationRange) * 0.5f;
+            var origin = mOrigin - new Vector3(VoxelizationRange, VoxelizationRange, VoxelizationRange) * 0.5f;
             return Matrix4x4.TRS(origin, Quaternion.identity, Vector3.one * VoxelSize);
         }
     }
@@ -146,27 +153,22 @@ public class VoxelGI : MonoBehaviour
         get { return voxelToWorld.inverse; }
     }
 
-
     public void BuildCamera()
     {
         var VoxelizationCameraObj = new GameObject("Voxelization Orth Camera") { hideFlags = HideFlags.HideAndDontSave  };
         VoxelizationCameraObj.SetActive(false);
-
-        var rect = new Rect(0f, 0f, 1f, 1f);
+        
         VoxelizationCamera = VoxelizationCameraObj.AddComponent<Camera>();
         VoxelizationCamera.allowMSAA = true;
         VoxelizationCamera.orthographic = true;
-        VoxelizationCamera.nearClipPlane = 0f;
-        VoxelizationCamera.pixelRect = rect;
+        VoxelizationCamera.pixelRect = new Rect(0f, 0f, 1f, 1f);
         VoxelizationCamera.depth = 1f;
-        //VoxelizationCamera.enabled = false;
-
+        VoxelizationCamera.enabled = false;
     }
 
-
-    public void BuildUavAndDescripters()
+    public void BuildDescripters()
     {
-        DescriptorAlbedo = new RenderTextureDescriptor()
+        mDescriptorGBuffer = new RenderTextureDescriptor()
         {
             width = VoxelTextureResolution,
             height = VoxelTextureResolution,
@@ -176,34 +178,6 @@ public class VoxelGI : MonoBehaviour
             enableRandomWrite = true,
             msaaSamples = 1
         };
-        UavAlbedo = new RenderTexture(DescriptorAlbedo);
-        UavAlbedo.Create();
-
-        DescriptorNormal = new RenderTextureDescriptor()
-        {
-            width = VoxelTextureResolution,
-            height = VoxelTextureResolution,
-            volumeDepth = VoxelTextureResolution,
-            colorFormat = RenderTextureFormat.RInt,
-            dimension = TextureDimension.Tex3D,
-            enableRandomWrite = true,
-            msaaSamples = 1
-        };
-        UavNormal = new RenderTexture(DescriptorAlbedo);
-        UavNormal.Create();
-
-        DescriptorEmissive = new RenderTextureDescriptor()
-        {
-            width = VoxelTextureResolution,
-            height = VoxelTextureResolution,
-            volumeDepth = VoxelTextureResolution,
-            colorFormat = RenderTextureFormat.RInt,
-            dimension = TextureDimension.Tex3D,
-            enableRandomWrite = true,
-            msaaSamples = 1
-        };
-        UavEmissive = new RenderTexture(DescriptorAlbedo);
-        UavEmissive.Create();
 
         DummyDesc = new RenderTextureDescriptor()
         {
@@ -215,14 +189,39 @@ public class VoxelGI : MonoBehaviour
             width = VoxelTextureResolution,
             msaaSamples = 1
         };
+        DummyTargetID = Shader.PropertyToID("DummyTarget");
+    }
+
+    public void BuildResources()
+    {
+        // build render textures.
+        UavAlbedo = new RenderTexture(mDescriptorGBuffer);
+        UavAlbedo.Create();
+
+        UavNormal = new RenderTexture(mDescriptorGBuffer);
+        UavNormal.Create();
+
+        UavEmissive = new RenderTexture(mDescriptorGBuffer);
+        UavEmissive.Create();
+
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
     }
 
-    public void SwitchCameraToOrthographicOrNot(bool enable)
+    public void ReleaseResources()
     {
-        RenderCamera.enabled = !enable;
-        VoxelizationCamera.enabled = enable;
+        // Release render textures.
+        UavAlbedo.DiscardContents();
+        UavAlbedo.Release();
+
+        UavNormal.DiscardContents();
+        UavNormal.Release();
+
+        UavEmissive.DiscardContents();
+        UavEmissive.Release();
+
+        DummyTex.DiscardContents();
+        DummyTex.Release();
     }
 
     public static Mesh GetMesh()
@@ -281,14 +280,16 @@ public class VoxelGI : MonoBehaviour
     {
         if(VoxelizationCamera)
         {
+            VoxelizationCamera.nearClipPlane = -VoxelizationRange;
             VoxelizationCamera.farClipPlane = VoxelizationRange;
             VoxelizationCamera.orthographicSize = 0.5f * VoxelizationRange;
             VoxelizationCamera.aspect = 1;
-
-            VoxelizationCamera.transform.position = gameObject.transform.position - Vector3.forward * VoxelizationCamera.orthographicSize;
-            VoxelizationCamera.transform.LookAt(gameObject.transform.position, Vector3.up);
+            
+            VoxelizationCamera.transform.position = mOrigin - Vector3.forward * VoxelizationCamera.orthographicSize;
+            VoxelizationCamera.transform.LookAt(mOrigin, Vector3.up);
         }
     }
+
     #endregion
 
     //********************************************************************************************************************************************************************
@@ -305,7 +306,6 @@ public class VoxelGI : MonoBehaviour
             0,
             RenderTextureFormat.ARGB2101010
             );
-
         mCommandBuffer.Clear();
     }
 
@@ -314,21 +314,22 @@ public class VoxelGI : MonoBehaviour
         RenderTexture.ReleaseTemporary(RTSceneColor);
     }
 
-    void Render()
+    void RenderVoxel()
     {
+        // clear 3d gbuffer
+        mCommandBuffer.SetRenderTarget(UavAlbedo, 0, CubemapFace.Unknown, -1);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
-        var viewProj = VoxelizationCamera.projectionMatrix * VoxelizationCamera.worldToCameraMatrix;
-
-        // #todo : clear 3d gbuffer here.
         //mCommandBuffer
+        var viewProj = VoxelizationCamera.projectionMatrix * VoxelizationCamera.worldToCameraMatrix;
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("VoxelizationVP"), viewProj);
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("VoxelToWorld"), voxelToWorld);
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("WorldToVoxel"), worldToVoxel);
         mCommandBuffer.SetRandomWriteTarget(1, UavAlbedo);
 
         // #todo : set a dummy rt here, don't forget to create and dispose rt resource.
-        mCommandBuffer.GetTemporaryRT(Shader.PropertyToID("DummyTarget"), DummyDesc);
-        mCommandBuffer.SetRenderTarget(DummyTex, RenderBufferLoadAction.DontCare, RenderBufferStoreAction.DontCare);
+        mCommandBuffer.GetTemporaryRT(DummyTargetID, DummyDesc);
+        mCommandBuffer.SetRenderTarget(DummyTargetID, RenderBufferLoadAction.DontCare, RenderBufferStoreAction.DontCare);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
         var gameObjects = FindObjectsOfType(typeof(GameObject)) as GameObject[];
@@ -350,7 +351,10 @@ public class VoxelGI : MonoBehaviour
         }
 
         mCommandBuffer.ClearRandomWriteTargets();
+    }
 
+    void RenderDebug()
+    {
         // Voxelization Debug Pass
         mCommandBuffer.SetGlobalVector(Shader.PropertyToID("CameraPosW"), RenderCamera.transform.position);
         var renderCameraVP = RenderCamera.projectionMatrix * RenderCamera.worldToCameraMatrix;
@@ -364,14 +368,6 @@ public class VoxelGI : MonoBehaviour
 
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexAlbedo"), UavAlbedo);
         mCommandBuffer.SetRenderTarget(RTSceneColor);
-        RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIVoxelizationDebug);
-        Blit(RTSceneColor, BuiltinRenderTextureType.CameraTarget);
-    }
-
-    void RenderDebug()
-    {
-        // Voxelization Debug Pass
-        
         RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIVoxelizationDebug);
         Blit(RTSceneColor, BuiltinRenderTextureType.CameraTarget);
     }
