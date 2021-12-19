@@ -19,10 +19,10 @@
 
 			CGPROGRAM
 				#pragma enable_d3d11_debug_symbols
-				//#pragma require geometry
+				#pragma require geometry
 				#pragma target 5.0
 				#pragma vertex VoxelizationVs
-				//#pragma geometry VoxelizationGs
+				#pragma geometry VoxelizationGs
 				#pragma fragment VoxelizationFs
 			ENDCG
 		}

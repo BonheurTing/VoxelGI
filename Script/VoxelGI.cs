@@ -14,6 +14,29 @@ public enum VoxelGbufferType
 [RequireComponent(typeof(Camera))]
 public class VoxelGI : MonoBehaviour
 {
+    //********************************************************************************************************************************************************************
+    // Reflection.
+    //********************************************************************************************************************************************************************
+
+    public int VoxelTextureResolution = 256;
+    public float VoxelSize = 0.25f;
+
+    public bool EnableConservativeRasterization;
+
+    [Range(0.0f, 3.0f)]
+    public float ConsevativeRasterScale = 1.5f;
+
+    public bool DebugMode = false;
+    
+    public VoxelGbufferType DebugType;
+
+    [Range(0.01f, 0.5f)]
+    public float RayStepSize = 0.03f;
+
+    //********************************************************************************************************************************************************************
+    // Private.
+    //********************************************************************************************************************************************************************
+
     private enum PassIndex
     {
         EPIVoxelization = 0,
@@ -30,8 +53,7 @@ public class VoxelGI : MonoBehaviour
     private Matrix4x4 ForwordViewMatrix;
     private Matrix4x4 RightViewMatrix;
     private Matrix4x4 UpViewMatrix;
-    public int VoxelTextureResolution = 256;
-    public float VoxelSize = 0.25f;
+
     public float VoxelizationRange
     {
         get
@@ -44,18 +66,13 @@ public class VoxelGI : MonoBehaviour
         get
         {
             Vector3 fixedCameraPos = RenderCamera.transform.position * VoxelSize;
-             Vector3Int intPosition = new Vector3Int((int)fixedCameraPos.x, (int)fixedCameraPos.y, (int)fixedCameraPos.z);
+            Vector3Int intPosition = new Vector3Int((int)fixedCameraPos.x, (int)fixedCameraPos.y, (int)fixedCameraPos.z);
             intPosition.x = (int)(intPosition.x / VoxelSize);
             intPosition.y = (int)(intPosition.y / VoxelSize);
             intPosition.z = (int)(intPosition.z / VoxelSize);
             return intPosition;
         }
     }
-
-    [Range(0.01f, 0.5f)]
-    public float RayStepSize = 0.03f;
-
-    public VoxelGbufferType TestVoxelGbuffer;
 
     private RenderTexture RTSceneColor;
     private int DummyTargetID;
@@ -116,7 +133,10 @@ public class VoxelGI : MonoBehaviour
 //             EndVoxelization();
             BeginRender();
             RenderVoxel();
-            RenderDebug();
+            if(DebugMode)
+            {
+                RenderDebug();
+            }
             EndRender();
         }
     }
@@ -243,38 +263,57 @@ public class VoxelGI : MonoBehaviour
         DummyTex.Release();
     }
 
-    public static Mesh GetMesh()
+    public static Mesh GetQuadMesh()
     {
         if (mMesh != null)
             return mMesh;
             mMesh = new Mesh();
-            mMesh.vertices = new Vector3[] {
+
+            mMesh.vertices = new Vector3[]
+            {
                 new Vector3(-1,-1,0.5f),
                 new Vector3(-1,1,0.5f),
                 new Vector3(1,1,0.5f),
+                new Vector3(-1,-1,0.5f),
+                new Vector3(1,1,0.5f),
                 new Vector3(1,-1,0.5f)
             };
-        mMesh.uv = new Vector2[] {
-                new Vector2(0,1),
+
+        mMesh.uv = new Vector2[]
+        {
                 new Vector2(0,0),
-                new Vector2(1,0),
-                new Vector2(1,1)
+                new Vector2(0,1),
+                new Vector2(1,1),
+                new Vector2(0,0),
+                new Vector2(1,1),
+                new Vector2(1,0)
             };
- 
-        mMesh.SetIndices(new int[] { 0, 1, 2, 3 }, MeshTopology.Quads, 0);
+
+        mMesh.normals = new Vector3[]
+        {
+                new Vector3(0f,0f,-1f),
+                new Vector3(0f,0f,-1f),
+                new Vector3(0f,0f,-1f),
+                new Vector3(0f,0f,-1f),
+                new Vector3(0f,0f,-1f),
+                new Vector3(0f,0f,-1f)
+        };
+
+        // winding : clockwise.
+        mMesh.SetIndices(new int[] { 0, 1, 2, 3, 4, 5 }, MeshTopology.Triangles, 0);
         return mMesh;
     }
 
     public void RenderScreenQuad(RenderTargetIdentifier renderTarget, Material mat, int pass)
     {
         mCommandBuffer.SetRenderTarget(renderTarget);
-        mCommandBuffer.DrawMesh(GetMesh(), Matrix4x4.identity, mat, 0, pass);
+        mCommandBuffer.DrawMesh(GetQuadMesh(), Matrix4x4.identity, mat, 0, pass);
     }
 
     public void RenderScreenQuad(RenderTargetIdentifier renderTarget, int mipLevel, Material mat, int pass)
     {
         mCommandBuffer.SetRenderTarget(renderTarget, mipLevel);
-        mCommandBuffer.DrawMesh(GetMesh(), Matrix4x4.identity, mat, 0, pass);
+        mCommandBuffer.DrawMesh(GetQuadMesh(), Matrix4x4.identity, mat, 0, pass);
     }
 
     public void Blit(RenderTargetIdentifier src, RenderTargetIdentifier dst)
@@ -335,6 +374,16 @@ public class VoxelGI : MonoBehaviour
             RenderTextureFormat.ARGB2101010
             );
         mCommandBuffer.Clear();
+
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("CameraPosW"), RenderCamera.transform.position);
+        var renderCameraVP = RenderCamera.projectionMatrix * RenderCamera.worldToCameraMatrix;
+        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraView"), RenderCamera.worldToCameraMatrix);
+        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraViewProj"), renderCameraVP);
+        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvView"), RenderCamera.cameraToWorldMatrix);
+        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvViewProj"), renderCameraVP.inverse);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraFielfOfView"), RenderCamera.fieldOfView);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraAspect"), RenderCamera.aspect);
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VoxelTextureResolution"), VoxelTextureResolution);
     }
 
     void EndRender()
@@ -365,8 +414,10 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetRandomWriteTarget(2, UavNormal);
         mCommandBuffer.SetRandomWriteTarget(3, UavEmissiveHSA);
         mCommandBuffer.SetRandomWriteTarget(4, UavBrightness);
+        
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("HalfPixelSize"), ConsevativeRasterScale / VoxelTextureResolution);
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("EnableConservativeRasterization"), EnableConservativeRasterization ? 1 : 0);
 
-        // #todo : set a dummy rt here, don't forget to create and dispose rt resource.
         mCommandBuffer.GetTemporaryRT(DummyTargetID, DummyDesc);
         mCommandBuffer.SetRenderTarget(DummyTargetID, RenderBufferLoadAction.DontCare, RenderBufferStoreAction.DontCare);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
@@ -385,9 +436,8 @@ public class VoxelGI : MonoBehaviour
             mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("ObjWorld"), obj.transform.localToWorldMatrix);
             mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ObjAlbedo"), objRenderer.sharedMaterial.GetTexture("_MainTex"));
             mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ObjEmissive"), objRenderer.sharedMaterial.GetTexture("_EmissionMap"));
-            // SwitchCameraToOrthographicOrNot(true);
+
             mCommandBuffer.DrawMesh(mesh.sharedMesh, obj.transform.localToWorldMatrix, mGiMaterial, 0, (int)PassIndex.EPIVoxelization);
-            //SwitchCameraToOrthographicOrNot(false);
         }
 
         mCommandBuffer.ClearRandomWriteTargets();
@@ -396,21 +446,14 @@ public class VoxelGI : MonoBehaviour
     void RenderDebug()
     {
         // Voxelization Debug Pass
-        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("CameraPosW"), RenderCamera.transform.position);
-        var renderCameraVP = RenderCamera.projectionMatrix * RenderCamera.worldToCameraMatrix;
-        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvView"), RenderCamera.cameraToWorldMatrix);
-        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvViewProj"), renderCameraVP.inverse);
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraFielfOfView"), RenderCamera.fieldOfView);
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraAspect"), RenderCamera.aspect);
-        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VoxelTextureResolution"), VoxelTextureResolution);
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("VoxelSize"), VoxelSize);
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("RayStepSize"), RayStepSize);
-        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VisualizeDebugType"), (int)TestVoxelGbuffer);
-
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexAlbedo"), UavAlbedo);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexNormal"), UavNormal);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexEmissive"), UavEmissiveHSA);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexBrightness"), UavBrightness);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("VoxelSize"), VoxelSize);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("RayStepSize"), RayStepSize);
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VisualizeDebugType"), (int)DebugType);
+
         mCommandBuffer.SetRenderTarget(RTSceneColor);
         RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIVoxelizationDebug);
         Blit(RTSceneColor, BuiltinRenderTextureType.CameraTarget);

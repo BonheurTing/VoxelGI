@@ -17,8 +17,9 @@ uniform RWTexture3D<uint> OutAlbedo : register(u1);
 uniform RWTexture3D<uint> OutNormal : register(u2);
 uniform RWTexture3D<uint> OutEmissive : register(u3);
 uniform RWTexture3D<uint> OutBrightness : register(u4);
-// debug
 float3 CameraPosW;
+float4x4  CameraView;
+float4x4  CameraViewProj;
 float4x4 CameraInvView;
 float4x4 CameraInvViewProj;
 float CameraFielfOfView; // degree
@@ -30,7 +31,10 @@ Texture3D<uint> VoxelTexAlbedo;
 Texture3D<uint> VoxelTexNormal;
 Texture3D<uint> VoxelTexEmissive;
 Texture3D<uint> VoxelTexBrightness;
+// debug
 int VisualizeDebugType;
+float HalfPixelSize;
+int EnableConservativeRasterization;
 
 // Util
 float3 RgbToHsl(float3 c)
@@ -179,6 +183,12 @@ void BrightnessMoveingAvg(uniform RWTexture3D<uint> outUav, int3 uvw, float2 val
 	}
 }
 
+float4 UnityClipToClipPos(float4 pos)
+{
+	pos.y = -pos.y;
+	return pos;
+}
+
 // Voxelization
 struct VoxelizationVsInput
 {
@@ -187,15 +197,15 @@ struct VoxelizationVsInput
 	float2 uv : TEXCOORD0;
 };
 
-/*
+
 struct VoxelizationGsInput
 {
-	float4 posH : SV_POSITION;
+	float4 posH : POSITION;
 	float4 posW : POSITION1;
 	float2 uv : TEXCOORD0;
 	float3 normal : NORMAL;
 };
-*/
+
 struct VoxelizationFsInput
 {
 	float4 posH : SV_POSITION;
@@ -206,7 +216,7 @@ struct VoxelizationFsInput
 
 VoxelizationGsInput VoxelizationVs(VoxelizationVsInput v)
 {
-	VoxelizationFsInput o;
+	VoxelizationGsInput o;
 
 	o.posW = mul(ObjWorld, v.vertex);
 	o.uv = v.uv;
@@ -233,14 +243,110 @@ VoxelizationGsInput VoxelizationVs(VoxelizationVsInput v)
 			o.posH = mul(VoxelizationUpVP, o.posW);
 		}
 	}
+
 	return o;
 }
 
-//[maxvertexcount(3)]
-//void VoxelizationGs(triangle VoxelizationGsInput i[3], inout TriangleStream<VoxelizationFsInput> triStream)
-//{
+[maxvertexcount(3)]
+void VoxelizationGs(triangle VoxelizationGsInput i[3], inout TriangleStream<VoxelizationFsInput> triStream)
+{
+	int j;
 
-//}
+	if (EnableConservativeRasterization == 0)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			VoxelizationFsInput o = (VoxelizationFsInput)0;
+			o.posH = i[j].posH;
+			o.posW = i[j].posW;
+			o.uv = i[j].uv;
+			o.normal = i[j].normal;
+			triStream.Append(o);
+		}
+		return;
+	}
+
+	float4 vertex[3];
+	float2 texCoord[3];
+	for (j = 0; j < 3; ++j)
+	{
+		vertex[j] = i[j].posH / i[j].posH.w; // vertex 
+		texCoord[j] = i[j].uv;
+	}
+
+	// Change winding, otherwise there are artifacts for the back faces
+	float3 clipTriangleNormal = normalize(cross(vertex[2].xyz - vertex[0].xyz, vertex[1].xyz - vertex[0].xyz));
+
+	if (clipTriangleNormal.z > 0.f)
+	{
+		// swap 1 2
+		float4 tempVertex = vertex[2];
+		float2 tempTexC = texCoord[2];
+		vertex[2] = vertex[1];
+		vertex[1] = tempVertex;
+		texCoord[2] = texCoord[1];
+		texCoord[1] = tempTexC;
+	}
+
+	// Triangle plane to later calculate the new z coordinate.
+	float4 trianglePlane;
+	trianglePlane.xyz = normalize(cross(vertex[2].xyz - vertex[0].xyz, vertex[1].xyz - vertex[0].xyz));
+	trianglePlane.w = -dot(vertex[0].xyz, trianglePlane.xyz);
+
+	if (trianglePlane.z > 0.001f)
+	{
+		return;
+	}
+
+	// Axis aligned bounding box (AABB).
+	// AABB initialized with maximum/minimum NDC values.
+	float4 aabb = float4(1.0f, 1.0f, -1.0f, -1.0f);
+	for (j = 0; j < 3; j++)
+	{
+		aabb.xy = min(aabb.xy, vertex[j].xy);
+		aabb.zw = max(aabb.zw, vertex[j].xy);
+	}
+	// Add offset of half pixel size to AABB.
+	aabb += float4(-HalfPixelSize.xx, HalfPixelSize.xx);
+
+	// expand the triangle.
+	float3 plane[3];
+	for (j = 0; j < 3; j++)
+	{
+		plane[j] = cross(vertex[(j + 2) % 3].xyw, vertex[(j + 1) % 3].xyw);
+		plane[j].z -= dot(HalfPixelSize.xx, abs(plane[j].xy));
+	}
+
+	// calculate intersection.
+	float3 intersect[3];
+	for (j = 0; j < 3; j++)
+	{
+		intersect[j] = cross(plane[(j + 1) % 3], plane[(j+ 2) % 3]);
+		if (intersect[j].z != 0.0f)
+		{
+			intersect[j] /= intersect[j].z;
+		}
+	}
+
+	for (j = 0; j < 3; j++)
+	{
+		vertex[j].xyz = intersect[j];
+		vertex[j].w = 1.f;
+		// Calculate the new z-Coordinate derived from a point on a plane.
+		vertex[j].z = -(trianglePlane.x * intersect[j].x + trianglePlane.y * intersect[j].y + trianglePlane.w) / trianglePlane.z;
+	}
+
+	[unroll]
+	for (j = 0; j < 3; j++)
+	{
+		VoxelizationFsInput o = (VoxelizationFsInput)0;
+		o.posH = vertex[j];
+		o.posW = i[j].posW;
+		o.uv = texCoord[j];
+		o.normal = i[j].normal;
+		triStream.Append(o);
+	}
+}
 
 half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 {
@@ -281,7 +387,7 @@ struct VoxelizationDebugFsInput
 VoxelizationDebugFsInput VoxelizationDebugVs(VoxelizationVsInput v)
 {
 	VoxelizationDebugFsInput o;
-	o.pos = v.vertex;
+	o.pos = UnityClipToClipPos(v.vertex);
 	o.uv = v.uv;
 	return o;
 }
