@@ -1,0 +1,108 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+
+#pragma enable_d3d11_debug_symbols
+#pragma kernel VoxelDirectLighting
+
+#define ENASBLE_SHADOW_SUN_BIAS 1
+#define ENASBLE_SHADOW_NORMAL_BIAS 0
+
+Texture3D<uint> RWAlbedo;
+Texture3D<uint> RWNormal;
+Texture3D<uint> RWEmissive;
+Texture3D<uint> RWOpacity;
+
+sampler2D ShadowDepth;
+
+float4x4 gVoxelToWorld;
+float4x4 gWorldToVoxel;
+float gVoxelSize;
+
+//------------------------------------------------------------------------------------------------------
+// Util
+//------------------------------------------------------------------------------------------------------
+
+uint EncodeGbuffer(float4 value)
+{
+	uint res = (uint(value.x * 255.f) << 24) + (uint(value.y * 255.f) << 16)
+		+ (uint(value.z * 255.f) << 8) + uint(value.w * 255.f);
+	return res;
+}
+
+float4 DecodeGbuffer(uint value)
+{
+	float4 res = float4(0.f, 0.f, 0.f, 0.f);
+	res.w = (value & 255) / 255.f;
+	value = value >> 8;
+	res.z = (value & 255) / 255.f;
+	value = value >> 8;
+	res.y = (value & 255) / 255.f;
+	value = value >> 8;
+	res.x = (value & 255) / 255.f;
+	return res;
+}
+
+
+//------------------------------------------------------------------------------------------------------
+// Calculate Voxel Direct Lighting.
+//------------------------------------------------------------------------------------------------------
+
+float3 SunLightColor;
+float3 SunLightDir;
+float SunLightIntensity;
+
+float LightIndensityMulti = 1.0f;
+float EmissiveMulti = 1.0f;
+
+float4x4 gWorldToShadowVP;
+
+float ShadowSunBias = 0.5f;
+float ShadowNormalBias = 0.0f;
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<half4> OutRadiance;
+
+[numthreads(4,4,4)]
+void VoxelDirectLighting(uint3 id : SV_DispatchThreadID)
+{
+	float3 voxelPos = float3(id)+float3(0.5f, 0.5f, 0.5f);
+	float3 worldPos = mul(gVoxelToWorld, float4(voxelPos, 1.0f)).xyz;
+	float3 voxelIrradiance = 0.f;
+
+	float3 albedo = DecodeGbuffer(RWAlbedo[id.xyz]);
+	float3 normal = DecodeGbuffer(RWNormal[id.xyz]);
+	normal = (normal * 2.f) - float3(1.f, 1.f, 1.f);
+	float3 emissive = DecodeGbuffer(RWEmissive[id.xyz]);
+	emissive = emissive * EmissiveMulti;
+	float opacity = DecodeGbuffer(RWOpacity[id.xyz]).x;
+
+	// shadow
+#if ENASBLE_SHADOW_NORMAL_BIAS
+	float3 shadowWorldPos = worldPos + normal * 0.5f * ShadowNormalBias * gVoxelSize;
+	float4 shadowPos = mul(gWorldToShadowVP, float4(shadowWorldPos, 1.0f));
+#elif ENASBLE_SHADOW_SUN_BIAS
+	float3 shadowWorldPos = worldPos - normalize(SunLightDir) * 0.5f * ShadowSunBias * gVoxelSize;
+	float4 shadowPos = mul(gWorldToShadowVP, float4(shadowWorldPos, 1.0f));
+#else
+	float4 shadowPos = mul(gWorldToShadowVP, float4(worldPos, 1.f));
+#endif
+	shadowPos /= shadowPos.w;
+	float2 shadowUV = shadowPos.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
+	float shadow = 1.f;
+	float shadowDepth = tex2Dlod(ShadowDepth, float4(shadowUV, 0, 0)).x;
+	if (shadowPos.z > shadowDepth)
+	{
+		shadow = 0.f;
+	}
+
+	float3 L = -SunLightDir;
+	float NdotL = max(dot(normal, L), 0.05f);
+	voxelIrradiance += NdotL * SunLightColor * SunLightIntensity * LightIndensityMulti * shadow;
+
+	voxelIrradiance *= albedo;
+
+	float3 resColor = voxelIrradiance + emissive;
+
+	OutRadiance[id.xyz] = float4(resColor, opacity);
+}
+

@@ -16,7 +16,7 @@ sampler2D ObjEmissive;
 uniform RWTexture3D<uint> OutAlbedo : register(u1);
 uniform RWTexture3D<uint> OutNormal : register(u2);
 uniform RWTexture3D<uint> OutEmissive : register(u3);
-uniform RWTexture3D<uint> OutBrightness : register(u4);
+uniform RWTexture3D<uint> OutOpacity : register(u4);
 float3 CameraPosW;
 float4x4  CameraView;
 float4x4  CameraViewProj;
@@ -27,14 +27,18 @@ float CameraAspect;
 int VoxelTextureResolution;
 float VoxelSize;
 float RayStepSize; // 0.5  --- < for 100
+// debug
 Texture3D<uint> VoxelTexAlbedo;
 Texture3D<uint> VoxelTexNormal;
 Texture3D<uint> VoxelTexEmissive;
-Texture3D<uint> VoxelTexBrightness;
-// debug
+Texture3D<uint> VoxelTexOpacity;
+Texture3D<half4> VoxelTexLighting;
+float EmissiveMulti;
 int VisualizeDebugType;
 float HalfPixelSize;
 int EnableConservativeRasterization;
+// ShadowMapping
+float4x4 WorldToShadowVP;
 
 // Util
 float3 RgbToHsl(float3 c)
@@ -160,7 +164,7 @@ void MovingAverage(uniform RWTexture3D<uint> outUav, int3 uvw, float4 val, int c
 	}
 }
 
-void BrightnessMoveingAvg(uniform RWTexture3D<uint> outUav, int3 uvw, float2 val)
+void OpacityMoveingAvg(uniform RWTexture3D<uint> outUav, int3 uvw, float2 val)
 {
 	uint newVal = EncodeFloat2ToUint248(val);
 	uint prevStoredVal = 0xFFFFFFFF;
@@ -212,6 +216,7 @@ struct VoxelizationFsInput
 	float4 posW : POSITION1;
 	float2 uv : TEXCOORD0;
 	float3 normal : NORMAL;
+	float4 aabb : TEXCOORD1;
 };
 
 VoxelizationGsInput VoxelizationVs(VoxelizationVsInput v)
@@ -344,19 +349,34 @@ void VoxelizationGs(triangle VoxelizationGsInput i[3], inout TriangleStream<Voxe
 		o.posW = i[j].posW;
 		o.uv = texCoord[j];
 		o.normal = i[j].normal;
+		o.aabb = aabb;
 		triStream.Append(o);
 	}
 }
 
 half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 {
+	if (EnableConservativeRasterization)
+	{
+		float2 inputPos = i.posH.xy;
+		inputPos /= VoxelTextureResolution;
+		inputPos = inputPos * float2(2.f, -2.f)  + float2(-1.f, 1.f);
+		if ((inputPos.x < i.aabb.x ||
+			inputPos.y < i.aabb.y ||
+			inputPos.x > i.aabb.z ||
+			inputPos.y > i.aabb.w)
+			)
+		{
+			discard;
+		}
+	}
 	// pbr
 	float4 albedo = tex2Dlod(ObjAlbedo, float4(i.uv,0,0));
 	i.normal = (i.normal + float3(1.f, 1.f, 1.f)) / 2.f;
 	float4 normalA = float4(i.normal, albedo.a);
 	float4 emissive = tex2Dlod(ObjEmissive, float4(i.uv, 0, 0));
 	//emissive.a = albedo.a;
-	float4 brightness = float4(albedo.a, 0.f, 0.f, albedo.a);
+	float4 opacity = float4(albedo.a, 0.f, 0.f, albedo.a);
 
 	// calculate the 3d tecture index
 	float4 posV = mul(WorldToVoxel, i.posW);
@@ -365,7 +385,7 @@ half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 	MovingAverage(OutAlbedo, uvw, albedo, 0);
 	MovingAverage(OutNormal, uvw, normalA, 1);
 	MovingAverage(OutEmissive, uvw, emissive, 0);
-	MovingAverage(OutBrightness, uvw, brightness, 3);
+	MovingAverage(OutOpacity, uvw, opacity, 3);
 
 	return half4(1.f, 0.f, 0.f, 1.0f);
 }
@@ -412,7 +432,7 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 	{
 		float4 rayWorld = float4(CameraPosW + rayDirW * RayStepSize * i, 1.f);
 		uint3 uvw = mul(WorldToVoxel, rayWorld).xyz; // VoxelTextureResolution;
-		float brightness = DecodeGbuffer(VoxelTexBrightness[uvw]).x;
+		float opacity = DecodeGbuffer(VoxelTexOpacity[uvw]).x;
 		float4 texSample = float4(0.f, 0.f, 0.f, 0.f);
 		switch (VisualizeDebugType)
 		{
@@ -425,10 +445,13 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 			break;
 		case 2: // emissive
 			texSample = DecodeGbuffer(VoxelTexEmissive[uvw]);
-			texSample.rgb *= 1.f;
+			texSample.rgb *= EmissiveMulti;
+			break;
+		case 3: // lighting
+			texSample = VoxelTexLighting[uvw];
 			break;
 		}
-		texSample.a = brightness;
+		texSample.a = opacity;
 
 		if (texSample.a > 0.0001f)
 		{
@@ -442,4 +465,24 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 		}
 	}
 	return accumulatedColor;
+}
+
+// Shadow Mapping
+
+struct ShadowFsInput
+{
+	float4 vertex : SV_POSITION;
+};
+
+ShadowFsInput ShadowVs(appdata_base v)
+{
+	ShadowFsInput o;
+	float4 posW = mul(ObjWorld, v.vertex);
+	o.vertex = mul(WorldToShadowVP, posW);
+	return o;
+}
+
+float ShadowFs(ShadowFsInput i) : SV_Target
+{
+	return i.vertex.z;
 }

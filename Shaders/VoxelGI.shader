@@ -29,7 +29,23 @@
 
 		pass
 		{
-			Name "VoxelizationPass"
+			Name "VoxelShadow"
+
+			Cull Back
+			ZWrite On
+			ZTest GEqual
+
+			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
+				#pragma target 5.0
+				#pragma vertex ShadowVs
+				#pragma fragment ShadowFs
+			ENDCG
+		}
+
+		pass
+		{
+			Name "VoxelVisualization"
 
 			Cull Off
 			ZWrite Off

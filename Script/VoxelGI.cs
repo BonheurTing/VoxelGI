@@ -7,7 +7,8 @@ public enum VoxelGbufferType
 {
     Albedo = 0,
     Normal,
-    Emissive
+    Emissive,
+    Lighting
 }
 
 [ExecuteInEditMode]
@@ -18,8 +19,20 @@ public class VoxelGI : MonoBehaviour
     // Reflection.
     //********************************************************************************************************************************************************************
 
+    public int ShadowMapResolution = 1024;
+    public float ShadowMapRange = 50f;
+
     public int VoxelTextureResolution = 256;
     public float VoxelSize = 0.25f;
+
+    public Light SunLight;
+    [Range(0.0f, 10.0f)]
+    public float LightIndensityMulti = 1.0f;
+    [Range(0.0f, 10.0f)]
+    public float EmissiveMulti = 1.0f;
+
+    public float ShadowSunBias = 0.5f;
+    public float ShadowNormalBias = 0.0f;
 
     public bool EnableConservativeRasterization;
 
@@ -40,8 +53,11 @@ public class VoxelGI : MonoBehaviour
     private enum PassIndex
     {
         EPIVoxelization = 0,
+        EPIVoxelShadow = 1,
         EPIVoxelizationDebug
     }
+
+    private int mComputeKernelIdLighting;
 
     // Voxelization Debug
     private Camera RenderCamera;
@@ -65,12 +81,12 @@ public class VoxelGI : MonoBehaviour
     {
         get
         {
-            Vector3 fixedCameraPos = RenderCamera.transform.position * VoxelSize;
+            Vector3 fixedCameraPos = RenderCamera.transform.position / VoxelSize;
             Vector3Int intPosition = new Vector3Int((int)fixedCameraPos.x, (int)fixedCameraPos.y, (int)fixedCameraPos.z);
-            intPosition.x = (int)(intPosition.x / VoxelSize);
-            intPosition.y = (int)(intPosition.y / VoxelSize);
-            intPosition.z = (int)(intPosition.z / VoxelSize);
-            return intPosition;
+            fixedCameraPos.x = intPosition.x * VoxelSize;
+            fixedCameraPos.y = intPosition.y * VoxelSize;
+            fixedCameraPos.z = intPosition.z * VoxelSize;
+            return fixedCameraPos;
         }
     }
 
@@ -78,13 +94,31 @@ public class VoxelGI : MonoBehaviour
     private int DummyTargetID;
     private RenderTexture DummyTex;
     private RenderTextureDescriptor DummyDesc;
-    private RenderTextureDescriptor mDescriptorGBuffer;
+    private RenderTextureDescriptor mGBufferDesc;
+    private RenderTextureDescriptor mLightingDesc;
     private RenderTexture UavAlbedo;
     private RenderTexture UavNormal;
-    private RenderTexture UavEmissiveHSA;
-    private RenderTexture UavBrightness;
+    private RenderTexture UavEmissive;
+    private RenderTexture UavOpacity;
+    private RenderTexture UavLighting;
 
     private static Mesh mMesh;
+
+    // computer shader : lighting
+    ComputeShader  mComputeShader;
+    Vector3 SunLightColor;
+    Vector3 SunLightDirection;
+    Vector3 SunLightIntensity;
+
+    // Shadowing
+    private Camera ShadowCamera;
+    private RenderTextureDescriptor mShadowCameraDesc;
+
+    private RenderTexture ShadowDummy;
+    private RenderTextureDescriptor mShadowDesc;
+    private RenderTexture mShadowDepth;
+    private RenderTextureDescriptor mShadowDepthDesc;
+    private Matrix4x4 ShadowViewMatrix;
 
     //********************************************************************************************************************************************************************
     // MonoBehaviour.
@@ -106,6 +140,12 @@ public class VoxelGI : MonoBehaviour
         {
             mCommandBuffer = new CommandBuffer();
             mCommandBuffer.name = "VXGI_CommandBuffer";
+        }
+
+        if (mComputeShader == null)
+        {
+            mComputeShader = (ComputeShader)Resources.Load("VoxelGICompute");
+            mComputeKernelIdLighting = mComputeShader.FindKernel("VoxelDirectLighting");
         }
 
         UpdateParam();
@@ -132,7 +172,9 @@ public class VoxelGI : MonoBehaviour
 //             BeforeVoxelization();
 //             EndVoxelization();
             BeginRender();
+            RenderShodowMap();
             RenderVoxel();
+            ComputeDirectLighting();
             if(DebugMode)
             {
                 RenderDebug();
@@ -197,16 +239,58 @@ public class VoxelGI : MonoBehaviour
         VoxelizationCamera.pixelRect = new Rect(0f, 0f, 1f, 1f);
         VoxelizationCamera.depth = 1f;
         VoxelizationCamera.enabled = false;
+
+        var ShadowCameraObj = new GameObject("Shadow Camera") { hideFlags = HideFlags.HideAndDontSave };
+        ShadowCameraObj.SetActive(false);
+
+        ShadowCamera = ShadowCameraObj.AddComponent<Camera>();
+        ShadowCamera.allowMSAA = true;
+        ShadowCamera.orthographic = true;
+        ShadowCamera.pixelRect = new Rect(0f, 0f, 1f, 1f);
+        ShadowCamera.depth = 1f;
+        ShadowCamera.enabled = false;
+
     }
 
     public void BuildDescripters()
     {
-        mDescriptorGBuffer = new RenderTextureDescriptor()
+        mShadowDesc = new RenderTextureDescriptor()
+        {
+            width = ShadowMapResolution,
+            height = ShadowMapResolution,
+            colorFormat = RenderTextureFormat.R8,
+            dimension = TextureDimension.Tex2D,
+            msaaSamples = 1,
+            volumeDepth = 1
+        };
+
+        mShadowDepthDesc = new RenderTextureDescriptor()
+        {
+            width = ShadowMapResolution,
+            height = ShadowMapResolution,
+            colorFormat = RenderTextureFormat.Depth,
+            dimension = TextureDimension.Tex2D,
+            msaaSamples = 1,
+            volumeDepth = 1
+        };
+
+        mGBufferDesc = new RenderTextureDescriptor()
         {
             width = VoxelTextureResolution,
             height = VoxelTextureResolution,
             volumeDepth = VoxelTextureResolution,
             colorFormat = RenderTextureFormat.RInt,
+            dimension = TextureDimension.Tex3D,
+            enableRandomWrite = true,
+            msaaSamples = 1
+        };
+
+        mLightingDesc = new RenderTextureDescriptor()
+        {
+            width = VoxelTextureResolution,
+            height = VoxelTextureResolution,
+            volumeDepth = VoxelTextureResolution,
+            colorFormat = RenderTextureFormat.ARGBHalf,
             dimension = TextureDimension.Tex3D,
             enableRandomWrite = true,
             msaaSamples = 1
@@ -228,39 +312,57 @@ public class VoxelGI : MonoBehaviour
     public void BuildResources()
     {
         // build render textures.
-        UavAlbedo = new RenderTexture(mDescriptorGBuffer);
+        ShadowDummy = new RenderTexture(mShadowDesc);
+        ShadowDummy.Create();
+
+        UavAlbedo = new RenderTexture(mGBufferDesc);
         UavAlbedo.Create();
 
-        UavNormal = new RenderTexture(mDescriptorGBuffer);
+        UavNormal = new RenderTexture(mGBufferDesc);
         UavNormal.Create();
 
-        UavEmissiveHSA = new RenderTexture(mDescriptorGBuffer);
-        UavEmissiveHSA.Create();
+        UavEmissive = new RenderTexture(mGBufferDesc);
+        UavEmissive.Create();
 
-        UavBrightness = new RenderTexture(mDescriptorGBuffer);
-        UavBrightness.Create();
+        UavOpacity = new RenderTexture(mGBufferDesc);
+        UavOpacity.Create();
+
+        UavLighting = new RenderTexture(mLightingDesc);
+        UavLighting.Create();
 
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
+
+        mShadowDepth = new RenderTexture(mShadowDepthDesc);
+        mShadowDepth.Create();
     }
 
     public void ReleaseResources()
     {
         // Release render textures.
+        ShadowDummy.DiscardContents();
+        ShadowDummy.Release();
+
         UavAlbedo.DiscardContents();
         UavAlbedo.Release();
 
         UavNormal.DiscardContents();
         UavNormal.Release();
 
-        UavEmissiveHSA.DiscardContents();
-        UavEmissiveHSA.Release();
+        UavEmissive.DiscardContents();
+        UavEmissive.Release();
 
-        UavBrightness.DiscardContents();
-        UavBrightness.Release();
+        UavOpacity.DiscardContents();
+        UavOpacity.Release();
+
+        UavLighting.DiscardContents();
+        UavLighting.Release();
 
         DummyTex.DiscardContents();
         DummyTex.Release();
+
+        mShadowDepth.DiscardContents();
+        mShadowDepth.Release();
     }
 
     public static Mesh GetQuadMesh()
@@ -355,6 +457,18 @@ public class VoxelGI : MonoBehaviour
             VoxelizationCamera.transform.LookAt(mOrigin, Vector3.up);
             ForwordViewMatrix = VoxelizationCamera.worldToCameraMatrix;
         }
+
+        if(ShadowCamera)
+        {
+            ShadowCamera.nearClipPlane = -ShadowMapRange * 10f;
+            ShadowCamera.farClipPlane = ShadowMapRange * 10f;
+            ShadowCamera.orthographicSize = ShadowMapRange;
+            ShadowCamera.aspect = 1;
+
+            ShadowCamera.transform.position = mOrigin - SunLight.transform.forward * ShadowCamera.orthographicSize;
+            ShadowCamera.transform.LookAt(mOrigin, Vector3.up);
+            ShadowViewMatrix = ShadowCamera.worldToCameraMatrix;
+        }
     }
 
     #endregion
@@ -391,16 +505,50 @@ public class VoxelGI : MonoBehaviour
         RenderTexture.ReleaseTemporary(RTSceneColor);
     }
 
+    void RenderShodowMap()
+    {
+        //         mCommandBuffer.BeginSample("Shadow Mapping");
+        mCommandBuffer.SetRenderTarget(ShadowDummy, mShadowDepth);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black, 0f);
+
+        mCommandBuffer.SetGlobalMatrix("WorldToShadowVP", ShadowCamera.projectionMatrix * ShadowViewMatrix);
+
+        var shadowGameObjects = FindObjectsOfType(typeof(GameObject)) as GameObject[];
+        foreach(var obj in shadowGameObjects)
+        {
+            var mesh = obj.GetComponent<MeshFilter>();
+            if (mesh == null)
+                continue;
+
+            var objRenderer = obj.GetComponent<Renderer>();
+            if (objRenderer == null)
+                continue;
+
+            mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("ObjWorld"), obj.transform.localToWorldMatrix);
+
+            if (objRenderer.shadowCastingMode != ShadowCastingMode.Off)
+            {
+                mCommandBuffer.DrawMesh(mesh.mesh, obj.transform.localToWorldMatrix, mGiMaterial, 0, (int)PassIndex.EPIVoxelShadow);
+            }
+        }
+
+        // mCommandBuffer.Blit(ShadowDummy, BuiltinRenderTextureType.CameraTarget);
+
+        //         mCommandBuffer.EndSample("Shadow Mapping");
+    }
+
     void RenderVoxel()
     {
-        // clear 3d gbuffer
+//         mCommandBuffer.BeginSample("Voxelization");
+
+        // cVoxelizationlear 3d gbuffer
         mCommandBuffer.SetRenderTarget(UavAlbedo, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
         mCommandBuffer.SetRenderTarget(UavNormal, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
-        mCommandBuffer.SetRenderTarget(UavEmissiveHSA, 0, CubemapFace.Unknown, -1);
+        mCommandBuffer.SetRenderTarget(UavEmissive, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
-        mCommandBuffer.SetRenderTarget(UavBrightness, 0, CubemapFace.Unknown, -1);
+        mCommandBuffer.SetRenderTarget(UavOpacity, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
         //mCommandBuffer
@@ -412,8 +560,8 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("WorldToVoxel"), worldToVoxel);
         mCommandBuffer.SetRandomWriteTarget(1, UavAlbedo);
         mCommandBuffer.SetRandomWriteTarget(2, UavNormal);
-        mCommandBuffer.SetRandomWriteTarget(3, UavEmissiveHSA);
-        mCommandBuffer.SetRandomWriteTarget(4, UavBrightness);
+        mCommandBuffer.SetRandomWriteTarget(3, UavEmissive);
+        mCommandBuffer.SetRandomWriteTarget(4, UavOpacity);
         
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("HalfPixelSize"), ConsevativeRasterScale / VoxelTextureResolution);
         mCommandBuffer.SetGlobalInt(Shader.PropertyToID("EnableConservativeRasterization"), EnableConservativeRasterization ? 1 : 0);
@@ -443,13 +591,61 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.ClearRandomWriteTargets();
     }
 
+    void ComputeDirectLighting()
+    {
+        mCommandBuffer.SetRenderTarget(UavLighting, 0, CubemapFace.Unknown, -1);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWAlbedo"), UavAlbedo);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWNormal"), UavNormal);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWEmissive"), UavEmissive);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWOpacity"), UavOpacity);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("ShadowDepth"), mShadowDepth);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("OutRadiance"), UavLighting);
+
+        mCommandBuffer.SetComputeMatrixParam(mComputeShader, "gVoxelToWorld", voxelToWorld);
+        mCommandBuffer.SetComputeMatrixParam(mComputeShader, "gWorldToVoxel", worldToVoxel);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "gVoxelSize", VoxelSize);
+
+        Debug.Assert(
+            (SunLight.type == LightType.Directional)
+            && (SunLight != null)
+            && (SunLight.isActiveAndEnabled),
+            "The sun is not directional.",
+            SunLight
+            );
+        mCommandBuffer.SetComputeVectorParam(mComputeShader, "SunLightColor", SunLight.color);
+        mCommandBuffer.SetComputeVectorParam(mComputeShader, "SunLightDir", SunLight.transform.forward);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "SunLightIntensity", SunLight.intensity);
+
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "LightIndensityMulti", LightIndensityMulti);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "EmissiveMulti", EmissiveMulti);
+
+        mCommandBuffer.SetComputeMatrixParam(mComputeShader, "gWorldToShadowVP", ShadowCamera.projectionMatrix * ShadowViewMatrix);
+
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "ShadowSunBias", ShadowSunBias);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "ShadowNormalBias", ShadowNormalBias);
+
+
+        mCommandBuffer.DispatchCompute(
+            mComputeShader,
+            mComputeKernelIdLighting,
+            (int)(VoxelTextureResolution) / 4 + 1,
+            (int)(VoxelTextureResolution) / 4 + 1,
+            (int)(VoxelTextureResolution) / 4 + 1
+            );
+    }
+
     void RenderDebug()
     {
         // Voxelization Debug Pass
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexAlbedo"), UavAlbedo);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexNormal"), UavNormal);
-        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexEmissive"), UavEmissiveHSA);
-        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexBrightness"), UavBrightness);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexEmissive"), UavEmissive);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexOpacity"), UavOpacity);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexLighting"), UavLighting);
+
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("EmissiveMulti"), EmissiveMulti);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("VoxelSize"), VoxelSize);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("RayStepSize"), RayStepSize);
         mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VisualizeDebugType"), (int)DebugType);
