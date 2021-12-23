@@ -33,12 +33,18 @@ Texture3D<uint> VoxelTexNormal;
 Texture3D<uint> VoxelTexEmissive;
 Texture3D<uint> VoxelTexOpacity;
 Texture3D<half4> VoxelTexLighting;
+Texture3D<half4> VoxelTexIndirectLighting;
 float EmissiveMulti;
 int VisualizeDebugType;
 float HalfPixelSize;
 int EnableConservativeRasterization;
+int DirectLightingDebugMipLevel;
+int IndirectLightingDebugMipLevel;
 // ShadowMapping
 float4x4 WorldToShadowVP;
+
+SamplerState point_clamp_sampler;
+SamplerState linear_clamp_sampler;
 
 // Util
 float3 RgbToHsl(float3 c)
@@ -431,27 +437,36 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 	for (int i = 0; i < totalSamples; ++i)
 	{
 		float4 rayWorld = float4(CameraPosW + rayDirW * RayStepSize * i, 1.f);
-		uint3 uvw = mul(WorldToVoxel, rayWorld).xyz; // VoxelTextureResolution;
+		float3 uvwLerp = mul(WorldToVoxel, rayWorld).xyz;
+		uint3 uvw = uvwLerp; // VoxelTextureResolution;
+		uvwLerp /= VoxelTextureResolution;
 		float opacity = DecodeGbuffer(VoxelTexOpacity[uvw]).x;
 		float4 texSample = float4(0.f, 0.f, 0.f, 0.f);
 		switch (VisualizeDebugType)
 		{
 		case 0: // albedo
 			texSample = DecodeGbuffer(VoxelTexAlbedo[uvw]);
+			texSample.a = opacity;
 			break;
 		case 1: // normal
 			texSample = DecodeGbuffer(VoxelTexNormal[uvw]);
 			texSample.rgb = (texSample.rgb * 2.f) - float3(1.f, 1.f, 1.f);
+			texSample.a = opacity;
 			break;
 		case 2: // emissive
 			texSample = DecodeGbuffer(VoxelTexEmissive[uvw]);
 			texSample.rgb *= EmissiveMulti;
+			texSample.a = opacity;
 			break;
 		case 3: // lighting
-			texSample = VoxelTexLighting[uvw];
+			texSample = VoxelTexLighting.SampleLevel(linear_clamp_sampler, uvwLerp, DirectLightingDebugMipLevel);
+			break;
+		case 4: // indirectlighting
+			texSample = VoxelTexIndirectLighting.SampleLevel(linear_clamp_sampler, uvwLerp, IndirectLightingDebugMipLevel);
+			break;
+		default:
 			break;
 		}
-		texSample.a = opacity;
 
 		if (texSample.a > 0.0001f)
 		{

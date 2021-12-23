@@ -8,7 +8,8 @@ public enum VoxelGbufferType
     Albedo = 0,
     Normal,
     Emissive,
-    Lighting
+    Lighting,
+    IndirectLighting
 }
 
 [ExecuteInEditMode]
@@ -19,32 +20,61 @@ public class VoxelGI : MonoBehaviour
     // Reflection.
     //********************************************************************************************************************************************************************
 
+    [Header("Voxelization")]
     public int ShadowMapResolution = 1024;
     public float ShadowMapRange = 50f;
-
     public int VoxelTextureResolution = 256;
     public float VoxelSize = 0.25f;
+    public int StableMipLevel = 2;
+    public bool EnableConservativeRasterization;
+    [Range(0.0f, 3.0f)]
+    public float ConsevativeRasterizeScale = 1.5f;
 
+    [Header("Direct Lighting")]
     public Light SunLight;
     [Range(0.0f, 10.0f)]
     public float LightIndensityMulti = 1.0f;
     [Range(0.0f, 10.0f)]
     public float EmissiveMulti = 1.0f;
-
     public float ShadowSunBias = 0.5f;
     public float ShadowNormalBias = 0.0f;
 
-    public bool EnableConservativeRasterization;
+    [Header("Indirect Lighting")]
+    public bool EnableSecondBounce = false;
+    [Range(1, 32)]
+    public int IndirectLightingMaxStepNum = 32;
+    [Range(1.0f, 10.0f)]
+    public float IndirectLightingAlphaAtten = 5f;
+    [Range(0.0f, 10.0f)]
+    public float IndirectLightingScale = 1f;
+    [Range(0.5f, 3f)]
+    public float IndirectLightingFirstStep = 1f;
+    [Range(1f, 3f)]
+    public float IndirectLightingStepScale = 1.5f;
+    [Range(20f, 150f)]
+    public float IndirectLightingConeAngle = 90f;
 
-    [Range(0.0f, 3.0f)]
-    public float ConsevativeRasterScale = 1.5f;
-
+    [Header("Voxel Visualization")]
     public bool DebugMode = false;
-    
     public VoxelGbufferType DebugType;
-
+    [Range(0, 10)]
+    public int DirectLightingDebugMipLevel = 0;
+    [Range(0, 10)]
+    public int IndirectLightingDebugMipLevel = 0;
     [Range(0.01f, 0.5f)]
     public float RayStepSize = 0.03f;
+
+    [System.Serializable]
+    public class TestClass
+    {
+        [SerializeField]
+        public int a1;
+        [SerializeField]
+        [Range(0.0f, 0.5f)]
+        public float a2;
+    };
+    [SerializeField]
+    public TestClass TestSerialization;
 
     //********************************************************************************************************************************************************************
     // Private.
@@ -57,7 +87,10 @@ public class VoxelGI : MonoBehaviour
         EPIVoxelizationDebug
     }
 
-    private int mComputeKernelIdLighting;
+    private int mComputeKernelIdDirectLighting;
+    private int mComputeKernelIdMipmap;
+    private int mComputeKernelIdCopyTexture3D;
+    private int mComputeKernelIdIndirectLighting;
 
     // Voxelization Debug
     private Camera RenderCamera;
@@ -77,38 +110,47 @@ public class VoxelGI : MonoBehaviour
             return VoxelSize * VoxelTextureResolution;
         }
     }
+
     private Vector3 mOrigin
     {
         get
         {
-            Vector3 fixedCameraPos = RenderCamera.transform.position / VoxelSize;
+            Vector3 fixedCameraPos = RenderCamera.transform.position / (VoxelSize * Mathf.Pow(2, StableMipLevel));
             Vector3Int intPosition = new Vector3Int((int)fixedCameraPos.x, (int)fixedCameraPos.y, (int)fixedCameraPos.z);
-            fixedCameraPos.x = intPosition.x * VoxelSize;
-            fixedCameraPos.y = intPosition.y * VoxelSize;
-            fixedCameraPos.z = intPosition.z * VoxelSize;
+            fixedCameraPos.x = intPosition.x  * (VoxelSize * Mathf.Pow(2, StableMipLevel));
+            fixedCameraPos.y = intPosition.y  * (VoxelSize * Mathf.Pow(2, StableMipLevel));
+            fixedCameraPos.z = intPosition.z  * (VoxelSize * Mathf.Pow(2, StableMipLevel));
             return fixedCameraPos;
         }
     }
 
+    private int mMipLevel
+    {
+        get
+        {
+            return (int)Mathf.Log(VoxelTextureResolution, 2) + 1;
+        }
+    }
+
+    private static Mesh mMesh;
     private RenderTexture RTSceneColor;
     private int DummyTargetID;
     private RenderTexture DummyTex;
     private RenderTextureDescriptor DummyDesc;
-    private RenderTextureDescriptor mGBufferDesc;
-    private RenderTextureDescriptor mLightingDesc;
+    
     private RenderTexture UavAlbedo;
     private RenderTexture UavNormal;
     private RenderTexture UavEmissive;
     private RenderTexture UavOpacity;
-    private RenderTexture UavLighting;
+    private RenderTextureDescriptor mGBufferDesc;
 
-    private static Mesh mMesh;
-
-    // computer shader : lighting
+    // computer shader :
+    // Lighting
     ComputeShader  mComputeShader;
-    Vector3 SunLightColor;
-    Vector3 SunLightDirection;
-    Vector3 SunLightIntensity;
+    private RenderTexture UavLighting;
+    private RenderTextureDescriptor mLightingDesc;
+    RenderTexture mSecondLightingRT;
+    RenderTexture mLightingPingPongRT;
 
     // Shadowing
     private Camera ShadowCamera;
@@ -145,7 +187,10 @@ public class VoxelGI : MonoBehaviour
         if (mComputeShader == null)
         {
             mComputeShader = (ComputeShader)Resources.Load("VoxelGICompute");
-            mComputeKernelIdLighting = mComputeShader.FindKernel("VoxelDirectLighting");
+            mComputeKernelIdDirectLighting = mComputeShader.FindKernel("VoxelDirectLighting");
+            mComputeKernelIdMipmap = mComputeShader.FindKernel("MipmapGeneration");
+            mComputeKernelIdCopyTexture3D = mComputeShader.FindKernel("CopyTexture3D");
+            mComputeKernelIdIndirectLighting = mComputeShader.FindKernel("VoxelIndirectLighting");
         }
 
         UpdateParam();
@@ -175,7 +220,11 @@ public class VoxelGI : MonoBehaviour
             RenderShodowMap();
             RenderVoxel();
             ComputeDirectLighting();
-            if(DebugMode)
+            if(EnableSecondBounce)
+            {
+                ComputeIndirectLighting();
+            }
+            if (DebugMode)
             {
                 RenderDebug();
             }
@@ -293,7 +342,9 @@ public class VoxelGI : MonoBehaviour
             colorFormat = RenderTextureFormat.ARGBHalf,
             dimension = TextureDimension.Tex3D,
             enableRandomWrite = true,
-            msaaSamples = 1
+            msaaSamples = 1,
+            useMipMap = true,
+            mipCount = mMipLevel
         };
 
         DummyDesc = new RenderTextureDescriptor()
@@ -330,6 +381,12 @@ public class VoxelGI : MonoBehaviour
         UavLighting = new RenderTexture(mLightingDesc);
         UavLighting.Create();
 
+        mSecondLightingRT = new RenderTexture(mLightingDesc);
+        mSecondLightingRT.Create();
+
+        mLightingPingPongRT = new RenderTexture(mLightingDesc);
+        mLightingPingPongRT.Create();
+
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
 
@@ -357,6 +414,12 @@ public class VoxelGI : MonoBehaviour
 
         UavLighting.DiscardContents();
         UavLighting.Release();
+
+        mSecondLightingRT.DiscardContents();
+        mSecondLightingRT.Release();
+
+        mLightingPingPongRT.DiscardContents();
+        mLightingPingPongRT.Release();
 
         DummyTex.DiscardContents();
         DummyTex.Release();
@@ -421,6 +484,24 @@ public class VoxelGI : MonoBehaviour
     public void Blit(RenderTargetIdentifier src, RenderTargetIdentifier dst)
     {
         mCommandBuffer.Blit(src, dst);
+    }
+
+    private void CopyTexture3D(RenderTexture src, RenderTexture dst, int mipLevel)
+    {
+        int mipRes = (int)((src.width + 0.01f) / Mathf.Pow(2f, mipLevel));
+        int groupNum = Mathf.Max(1, Mathf.CeilToInt(mipRes / 8f));
+        mCommandBuffer.SetComputeIntParam(mComputeShader, "CopyMipLevel", mipLevel);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdCopyTexture3D, Shader.PropertyToID("TexSrc"), src);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdCopyTexture3D, Shader.PropertyToID("TexDst"), dst, mipLevel);
+        mCommandBuffer.DispatchCompute(
+            mComputeShader,
+            mComputeKernelIdCopyTexture3D,
+            groupNum,
+            groupNum,
+            groupNum
+            );
+
+        mCommandBuffer.ClearRandomWriteTargets();
     }
 
     #endregion
@@ -563,7 +644,7 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetRandomWriteTarget(3, UavEmissive);
         mCommandBuffer.SetRandomWriteTarget(4, UavOpacity);
         
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("HalfPixelSize"), ConsevativeRasterScale / VoxelTextureResolution);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("HalfPixelSize"), ConsevativeRasterizeScale / VoxelTextureResolution);
         mCommandBuffer.SetGlobalInt(Shader.PropertyToID("EnableConservativeRasterization"), EnableConservativeRasterization ? 1 : 0);
 
         mCommandBuffer.GetTemporaryRT(DummyTargetID, DummyDesc);
@@ -596,15 +677,16 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetRenderTarget(UavLighting, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWAlbedo"), UavAlbedo);
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWNormal"), UavNormal);
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWEmissive"), UavEmissive);
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("RWOpacity"), UavOpacity);
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("ShadowDepth"), mShadowDepth);
-        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdLighting, Shader.PropertyToID("OutRadiance"), UavLighting);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("RWAlbedo"), UavAlbedo);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("RWNormal"), UavNormal);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("RWEmissive"), UavEmissive);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("RWOpacity"), UavOpacity);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("ShadowDepth"), mShadowDepth);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdDirectLighting, Shader.PropertyToID("OutRadiance"), UavLighting);
 
         mCommandBuffer.SetComputeMatrixParam(mComputeShader, "gVoxelToWorld", voxelToWorld);
         mCommandBuffer.SetComputeMatrixParam(mComputeShader, "gWorldToVoxel", worldToVoxel);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "gVoxelTextureResolution", VoxelTextureResolution);
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "gVoxelSize", VoxelSize);
 
         Debug.Assert(
@@ -626,14 +708,90 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "ShadowSunBias", ShadowSunBias);
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "ShadowNormalBias", ShadowNormalBias);
 
-
         mCommandBuffer.DispatchCompute(
             mComputeShader,
-            mComputeKernelIdLighting,
+            mComputeKernelIdDirectLighting,
             (int)(VoxelTextureResolution) / 4 + 1,
             (int)(VoxelTextureResolution) / 4 + 1,
             (int)(VoxelTextureResolution) / 4 + 1
             );
+
+        mCommandBuffer.ClearRandomWriteTargets();
+
+        // generate direct lighting mipmap
+        for (var i = 0; i < mMipLevel - 1; i++)
+        {
+            int currentRes = (int)((VoxelTextureResolution + 0.01f) / Mathf.Pow(2f, i + 1f));
+            int groupNum = Mathf.CeilToInt(currentRes / 8f);
+
+            mCommandBuffer.SetComputeIntParam(mComputeShader, "DstRes", currentRes);
+            mCommandBuffer.SetComputeIntParam(mComputeShader, "SrcMipLevel", i);
+            mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapSrc"), UavLighting);
+            mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapDst"), mLightingPingPongRT, i + 1);
+
+            mCommandBuffer.DispatchCompute(
+                mComputeShader,
+                mComputeKernelIdMipmap,
+                groupNum,
+                groupNum,
+                groupNum
+                );
+
+            mCommandBuffer.ClearRandomWriteTargets();
+
+            CopyTexture3D(mLightingPingPongRT, UavLighting, i + 1);
+        }
+    }
+
+    void ComputeIndirectLighting()
+    {
+        mCommandBuffer.SetRenderTarget(mSecondLightingRT, 0, CubemapFace.Unknown, -1);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdIndirectLighting, Shader.PropertyToID("RWAlbedo"), UavAlbedo);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdIndirectLighting, Shader.PropertyToID("RWNormal"), UavNormal);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdIndirectLighting, Shader.PropertyToID("RWOpacity"), UavOpacity);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdIndirectLighting, Shader.PropertyToID("VoxelLighting"), UavLighting);
+        mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdIndirectLighting, Shader.PropertyToID("OutIndirectRadiance"), mSecondLightingRT);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingMaxMipLevel", mMipLevel);
+        mCommandBuffer.SetComputeIntParam(mComputeShader, "IndirectLightingMaxStepNum", IndirectLightingMaxStepNum);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingAlphaAtten", IndirectLightingAlphaAtten);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingScale", IndirectLightingScale);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingFirstStep", IndirectLightingFirstStep);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingStepScale", IndirectLightingStepScale);
+        mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingConeAngle", IndirectLightingConeAngle);
+
+        mCommandBuffer.DispatchCompute(
+                mComputeShader,
+                mComputeKernelIdIndirectLighting,
+                (int)(VoxelTextureResolution) / 8 + 1,
+                (int)(VoxelTextureResolution) / 8 + 1,
+                (int)(VoxelTextureResolution) / 8 + 1
+                );
+
+        // generate indirect lighting mipmap
+        for (var i = 0; i < mMipLevel - 1; i++)
+        {
+            int currentRes = (int)((VoxelTextureResolution + 0.01f) / Mathf.Pow(2f, i + 1f));
+            int groupNum = Mathf.CeilToInt(currentRes / 8f);
+
+            mCommandBuffer.SetComputeIntParam(mComputeShader, "DstRes", currentRes);
+            mCommandBuffer.SetComputeIntParam(mComputeShader, "SrcMipLevel", i);
+            mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapSrc"), mSecondLightingRT);
+            mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapDst"), mLightingPingPongRT, i + 1);
+
+            mCommandBuffer.DispatchCompute(
+                mComputeShader,
+                mComputeKernelIdMipmap,
+                groupNum,
+                groupNum,
+                groupNum
+                );
+
+            mCommandBuffer.ClearRandomWriteTargets();
+
+            CopyTexture3D(mLightingPingPongRT, mSecondLightingRT, i + 1);
+        }
     }
 
     void RenderDebug()
@@ -644,11 +802,15 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexEmissive"), UavEmissive);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexOpacity"), UavOpacity);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexLighting"), UavLighting);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexIndirectLighting"), mSecondLightingRT);
 
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("EmissiveMulti"), EmissiveMulti);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("VoxelSize"), VoxelSize);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("RayStepSize"), RayStepSize);
         mCommandBuffer.SetGlobalInt(Shader.PropertyToID("VisualizeDebugType"), (int)DebugType);
+
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("DirectLightingDebugMipLevel"), Mathf.Clamp(DirectLightingDebugMipLevel, 0, mMipLevel - 1));
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("IndirectLightingDebugMipLevel"), Mathf.Clamp(IndirectLightingDebugMipLevel, 0, mMipLevel - 1));
 
         mCommandBuffer.SetRenderTarget(RTSceneColor);
         RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIVoxelizationDebug);
