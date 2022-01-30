@@ -22,6 +22,7 @@ float4x4  CameraView;
 float4x4  CameraViewProj;
 float4x4 CameraInvView;
 float4x4 CameraInvViewProj;
+float4x4 CameraReprojectInvViewProj;
 float CameraFielfOfView; // degree
 float CameraAspect;
 int VoxelTextureResolution;
@@ -42,9 +43,39 @@ int DirectLightingDebugMipLevel;
 int IndirectLightingDebugMipLevel;
 // ShadowMapping
 float4x4 WorldToShadowVP;
-
 SamplerState point_clamp_sampler;
 SamplerState linear_clamp_sampler;
+// Cone Tracing
+sampler2D _CameraDepthTexture;
+sampler2D _CameraDepthNormalsTexture;
+sampler2D ScreenNormal;
+sampler2D ScreenAlbedo;
+Texture3D<float4> ScreenConeTraceLighting;
+float ScreenMaxMipLevel;
+int ScreenMaxStepNum;
+float ScreenAlphaAtten;
+float ScreenScale;
+float ScreenConeAngle;
+float ScreenFirstStep;
+float ScreenStepScale;
+sampler2D SceneDirect;
+sampler2D VXGIIndirect;
+
+#define INDIRECT_CONE_TRACE_MID 1
+
+#if INDIRECT_CONE_TRACE_VERY_LOW
+#define CONE_COUNT 1
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_1
+#elif INDIRECT_CONE_TRACE_LOW
+#define CONE_COUNT 4
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_4
+#elif INDIRECT_CONE_TRACE_MID
+#define CONE_COUNT 8
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_8
+#elif INDIRECT_CONE_TRACE_HIGH
+#define CONE_COUNT 16
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_16
+#endif
 
 // Util
 float3 RgbToHsl(float3 c)
@@ -198,6 +229,70 @@ float4 UnityClipToClipPos(float4 pos)
 	pos.y = -pos.y;
 	return pos;
 }
+
+float CalcMipLevel(float size)
+{
+	return size <= 1.0 ? size : log2(size) + 1;
+}
+
+float3x3 GetTangentBasis(float3 TangentZ)
+{
+	float3 UpVector = abs(TangentZ.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	float3 TangentX = normalize(cross(UpVector, TangentZ));
+	float3 TangentY = cross(TangentZ, TangentX);
+	return float3x3(TangentX, TangentY, TangentZ);
+}
+
+float TextureSDF(float3 position)
+{
+	position = .5f - abs(position - .5f);
+	return min(min(position.x, position.y), position.z);
+}
+
+static float3 Fibonacci_Lattice_Hemisphere_1[1] =
+{
+	float3(0.0, 0.0, 1.0)
+};
+
+static float3 Fibonacci_Lattice_Hemisphere_4[4] =
+{
+	float3(-0.731585503467728, -0.670192249370187, 0.125),
+	float3(0.0810458159223954, 0.923475270768781, 0.375),
+	float3(0.474962433620099, -0.619504387918014, 0.625),
+	float3(-0.476722366176565, 0.0843254741286256, 0.875),
+};
+
+static float3 Fibonacci_Lattice_Hemisphere_8[8] =
+{
+	float3(-0.735927295315164, -0.674169686362497, 0.0625),
+	float3(0.0858751947674414, 0.978503551819642, 0.1875),
+	float3(0.577966879673501, -0.75385544768243, 0.3125),
+	float3(-0.885472495182538, 0.156627616578975, 0.4375),
+	float3(0.697614586708622, 0.443765296537886, 0.5625),
+	float3(-0.188520590528854, -0.701287200044783, 0.6875),
+	float3(-0.26869090798331, 0.517347993102423, 0.8125),
+	float3(0.326869977432545, -0.119372391503427, 0.9375),
+};
+
+static float3 Fibonacci_Lattice_Hemisphere_16[16] =
+{
+	float3(-0.737008746736654, -0.675160384452218, 0.03125),
+	float3(0.0870406817287227, 0.991783674610648, 0.09375),
+	float3(0.600965734598756, -0.783853381276229, 0.15625),
+	float3(-0.960864647623557, 0.169963426793115, 0.21875),
+	float3(0.80969671855586, 0.515062774290544, 0.28125),
+	float3(-0.243784330107323, -0.906865556680881, 0.34375),
+	float3(-0.421159310808654, 0.810916624825992, 0.40625),
+	float3(0.829731504061828, -0.303016614507021, 0.46875),
+	float3(-0.783119519232434, -0.323260353426092, 0.53125),
+	float3(0.341047499504824, 0.72879869688516, 0.59375),
+	float3(0.225822703319255, -0.71995836279995, 0.65625),
+	float3(-0.601554193574072, 0.34861295112696, 0.71875),
+	float3(0.609658853079947, 0.134031788622115, 0.78125),
+	float3(-0.308692885622987, -0.43908386427396, 0.84375),
+	float3(-0.0543268871447994, 0.419236838592646, 0.90625),
+	float3(0.189662913959254, -0.159848104675922, 0.96875),
+};
 
 // Voxelization
 struct VoxelizationVsInput
@@ -501,3 +596,123 @@ float ShadowFs(ShadowFsInput i) : SV_Target
 {
 	return i.vertex.z;
 }
+
+// Cone Tracing
+struct ConeTracingVsInput
+{
+	float3 vertex : POSITION;
+	float2 uv : TEXCOORD0; // 0-1
+};
+
+struct ConeTracingFsInput
+{
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+float3 CalculateScreenIrradiance(float4 voxelPos, float3 normal)
+{
+	if (TextureSDF(voxelPos / VoxelTextureResolution) < 0.0)
+	{
+		return float3(0.f, 0.f, 0.f);
+	}
+
+	normal = normalize(normal);
+	float3 origin = voxelPos / VoxelTextureResolution;
+
+	float3x3 TangentBasis = GetTangentBasis(normal);
+	float coneTan = tan(ScreenConeAngle * 3.14159265f / 360.f);
+	float offset, sampleRadius, step, ndotl;
+	float3 coordinate, coneDir;
+	float4 coneColor, resultColor = float4(0.f, 0.f, 0.f, 0.f);
+	int coneIndex, stepNum;
+
+	for (coneIndex = 0; coneIndex < CONE_COUNT; ++coneIndex)
+	{
+		coneColor = float4(0.f, 0.f, 0.f, 0.f);
+		step = ScreenFirstStep / VoxelTextureResolution;
+		offset = step;
+		sampleRadius = offset * coneTan;
+		coneDir = Fibonacci_Lattice_Hemisphere[coneIndex];
+		coneDir = normalize(mul(coneDir, TangentBasis));
+
+		coordinate = origin + offset * coneDir;
+		int stepNum = 0;
+		[loop]
+		while (coneColor.a < 0.95f && TextureSDF(coordinate) > 0.0f && stepNum <= ScreenMaxStepNum)
+		{
+			float mip = clamp(CalcMipLevel(sampleRadius * VoxelTextureResolution), 0.0, ScreenMaxMipLevel);
+			float4 sampledRadiance = ScreenConeTraceLighting.SampleLevel(linear_clamp_sampler, coordinate, mip);
+			coneColor += (1.f - pow(coneColor.a, ScreenAlphaAtten)) *  sampledRadiance;
+
+			step *= ScreenStepScale;
+			offset += step;
+			sampleRadius = offset * coneTan;
+			coordinate = origin + offset * coneDir;
+			stepNum++;
+		}
+
+		ndotl = dot(coneDir, normal);
+		resultColor += coneColor * ndotl;
+	}
+
+	return resultColor.xyz;
+}
+
+ConeTracingFsInput ConeTracingVs(ConeTracingVsInput v)
+{
+	ConeTracingFsInput o;
+	o.pos = UnityClipToClipPos(float4(v.vertex, 1.f));
+	o.uv = v.uv;
+	return o;
+}
+
+float4 ConeTracingFs(ConeTracingFsInput i) : SV_Target
+{
+	// depth to world pos
+	float depth = tex2D(_CameraDepthTexture, i.uv).r;
+	float4 clipPos = float4(mad(2.0, float2(i.uv.x, 1 - i.uv.y), -1.0), depth, 1.0);
+	float4 worldPos = mul(CameraReprojectInvViewProj, clipPos);
+	worldPos /= worldPos.w;
+	float3 voxelPos = mul(WorldToVoxel, worldPos);
+
+	// normal
+	float3 N = tex2D(ScreenNormal, i.uv).xyz;
+	N = normalize(N * 2.f - 1.f);
+
+	float3 screenIrradiance = CalculateScreenIrradiance(float4(voxelPos, 1.f), N);
+
+	float3 albedo = tex2D(ScreenAlbedo, i.uv).xyz;
+
+	float3 resultColor = screenIrradiance * albedo * ScreenScale;
+
+	return float4(resultColor, 1.f);
+}
+
+struct CombineVsInput
+{
+	float3 vertex : POSITION;
+	float2 uv : TEXCOORD0; // 0-1
+};
+
+struct CombineFsInput
+{
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+CombineFsInput CombineVs(CombineVsInput v)
+{
+	CombineFsInput o;
+	o.pos = UnityClipToClipPos(float4(v.vertex, 1.f));
+	o.uv = v.uv;
+	return o;
+}
+
+float4 CombineFs(CombineFsInput i) : SV_Target
+{
+	float3 sceneColor = tex2D(SceneDirect, i.uv).rgb;
+	float3 vxgiColor = tex2D(VXGIIndirect, i.uv).rgb;
+	return float4(sceneColor + vxgiColor, 1.f);
+}
+

@@ -45,6 +45,38 @@
 
 		pass
 		{
+			Name "ConeTracing"
+
+			Cull Back
+			ZWrite On
+			ZTest Off
+
+			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
+				#pragma target 5.0
+				#pragma vertex ConeTracingVs
+				#pragma fragment ConeTracingFs
+			ENDCG
+		}
+
+		pass
+		{
+			Name "Combine"
+
+			Cull Back
+			ZWrite On
+			ZTest Off
+
+			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
+				#pragma target 5.0
+				#pragma vertex CombineVs
+				#pragma fragment CombineFs
+			ENDCG
+		}
+		
+		pass
+		{
 			Name "VoxelVisualization"
 
 			Cull Off

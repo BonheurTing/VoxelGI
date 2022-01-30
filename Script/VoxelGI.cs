@@ -54,6 +54,21 @@ public class VoxelGI : MonoBehaviour
     [Range(20f, 150f)]
     public float IndirectLightingConeAngle = 90f;
 
+    [Header("Cone Tracing")]
+    [Range(1, 32)]
+    public int ScreenMaxStepNum = 32;
+    [Range(1.0f, 10.0f)]
+    public float ScreenAlphaAtten = 5f;
+    [Range(0.0f, 10.0f)]
+    public float ScreenScale = 1f;
+    [Range(0.5f, 3f)]
+    public float ScreenFirstStep = 1.5f;
+    [Range(1f, 3f)]
+    public float ScreenStepScale = 1f;
+    [Range(20f, 150f)]
+    public float ScreenConeAngle = 90f;
+
+
     [Header("Voxel Visualization")]
     public bool DebugMode = false;
     public VoxelGbufferType DebugType;
@@ -84,6 +99,8 @@ public class VoxelGI : MonoBehaviour
     {
         EPIVoxelization = 0,
         EPIVoxelShadow = 1,
+        EPIConeTracing = 2,
+        EPICombine = 3,
         EPIVoxelizationDebug
     }
 
@@ -134,6 +151,7 @@ public class VoxelGI : MonoBehaviour
 
     private static Mesh mMesh;
     private RenderTexture RTSceneColor;
+    private RenderTexture RTConeTracing;
     private int DummyTargetID;
     private RenderTexture DummyTex;
     private RenderTextureDescriptor DummyDesc;
@@ -143,6 +161,10 @@ public class VoxelGI : MonoBehaviour
     private RenderTexture UavEmissive;
     private RenderTexture UavOpacity;
     private RenderTextureDescriptor mGBufferDesc;
+
+    // Cone Tracing
+    private RenderTexture ConeTracingRT;
+    private RenderTextureDescriptor mConeTraceDesc;
 
     // computer shader :
     // Lighting
@@ -199,6 +221,7 @@ public class VoxelGI : MonoBehaviour
     void OnEnable()
     {
         //Screen.SetResolution(1900, 900, true);
+        //Camera.main.depthTextureMode = DepthTextureMode.Depth;
 
         if (mCommandBuffer != null)
         {
@@ -224,6 +247,8 @@ public class VoxelGI : MonoBehaviour
             {
                 ComputeIndirectLighting();
             }
+            ScreenConeTracing();
+            Combine();
             if (DebugMode)
             {
                 RenderDebug();
@@ -347,6 +372,16 @@ public class VoxelGI : MonoBehaviour
             mipCount = mMipLevel
         };
 
+        mConeTraceDesc = new RenderTextureDescriptor()
+        {
+            height = RenderCamera.pixelHeight,
+            width = RenderCamera.pixelWidth,
+            volumeDepth = 1,
+            colorFormat = RenderTextureFormat.ARGBHalf,
+            dimension = TextureDimension.Tex2D,
+            msaaSamples = 1
+        };
+
         DummyDesc = new RenderTextureDescriptor()
         {
             colorFormat = RenderTextureFormat.R8,
@@ -387,6 +422,9 @@ public class VoxelGI : MonoBehaviour
         mLightingPingPongRT = new RenderTexture(mLightingDesc);
         mLightingPingPongRT.Create();
 
+        ConeTracingRT = new RenderTexture(mConeTraceDesc);
+        ConeTracingRT.Create();
+
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
 
@@ -420,6 +458,9 @@ public class VoxelGI : MonoBehaviour
 
         mLightingPingPongRT.DiscardContents();
         mLightingPingPongRT.Release();
+
+        ConeTracingRT.DiscardContents();
+        ConeTracingRT.Release();
 
         DummyTex.DiscardContents();
         DummyTex.Release();
@@ -566,7 +607,13 @@ public class VoxelGI : MonoBehaviour
             RenderCamera.pixelWidth,
             RenderCamera.pixelHeight,
             0,
-            RenderTextureFormat.ARGB2101010
+            RenderTextureFormat.ARGBHalf
+            );
+        RTConeTracing = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
             );
         mCommandBuffer.Clear();
 
@@ -575,6 +622,7 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraView"), RenderCamera.worldToCameraMatrix);
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraViewProj"), renderCameraVP);
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvView"), RenderCamera.cameraToWorldMatrix);
+        mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraReprojectInvViewProj"), (GL.GetGPUProjectionMatrix(RenderCamera.projectionMatrix, true) * RenderCamera.worldToCameraMatrix).inverse);
         mCommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvViewProj"), renderCameraVP.inverse);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraFielfOfView"), RenderCamera.fieldOfView);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraAspect"), RenderCamera.aspect);
@@ -584,6 +632,7 @@ public class VoxelGI : MonoBehaviour
     void EndRender()
     {
         RenderTexture.ReleaseTemporary(RTSceneColor);
+        RenderTexture.ReleaseTemporary(RTConeTracing);
     }
 
     void RenderShodowMap()
@@ -620,8 +669,6 @@ public class VoxelGI : MonoBehaviour
 
     void RenderVoxel()
     {
-//         mCommandBuffer.BeginSample("Voxelization");
-
         // cVoxelizationlear 3d gbuffer
         mCommandBuffer.SetRenderTarget(UavAlbedo, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
@@ -792,6 +839,40 @@ public class VoxelGI : MonoBehaviour
 
             CopyTexture3D(mLightingPingPongRT, mSecondLightingRT, i + 1);
         }
+    }
+
+    void ScreenConeTracing()
+    {
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenMaxMipLevel"), mMipLevel);
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("ScreenMaxStepNum"), ScreenMaxStepNum);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenAlphaAtten"), ScreenAlphaAtten);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenScale"), ScreenScale);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenConeAngle"), ScreenConeAngle);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenFirstStep"), ScreenFirstStep);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenStepScale"), ScreenStepScale);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenNormal"), BuiltinRenderTextureType.GBuffer2);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenAlbedo"), BuiltinRenderTextureType.GBuffer0);
+        if(EnableSecondBounce)
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenConeTraceLighting"), mSecondLightingRT);
+        }
+        else
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenConeTraceLighting"), UavLighting);
+        }
+        mCommandBuffer.SetRenderTarget(ConeTracingRT);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+        RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIConeTracing);
+    }
+
+    void Combine()
+    {
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), RTSceneColor);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("SceneDirect"), BuiltinRenderTextureType.CameraTarget);
+        mCommandBuffer.SetRenderTarget(RTConeTracing);
+        mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+        RenderScreenQuad(RTConeTracing, mGiMaterial, (int)PassIndex.EPICombine);
+        Blit(RTConeTracing, BuiltinRenderTextureType.CameraTarget);
     }
 
     void RenderDebug()

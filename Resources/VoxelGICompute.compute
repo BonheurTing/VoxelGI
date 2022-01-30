@@ -296,7 +296,6 @@ float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 	float3 coordinate, coneDir;
 	float4 coneColor, resultColor = float4(0.f, 0.f, 0.f, 0.f);
 	int coneIndex, stepNum;
-	float totalWeight = 0;
 
 	for (coneIndex = 0; coneIndex < CONE_COUNT; ++coneIndex)
 	{
@@ -325,9 +324,7 @@ float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 
 		ndotl = dot(coneDir, normal);
 		resultColor += coneColor * ndotl;
-		totalWeight += ndotl;
 	}
-	resultColor /= totalWeight;
 
 	return resultColor.xyz;
 }
