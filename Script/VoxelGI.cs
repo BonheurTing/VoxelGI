@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
+using System;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -9,7 +10,9 @@ public enum VoxelGbufferType
     Normal,
     Emissive,
     Lighting,
-    IndirectLighting
+    IndirectLighting,
+    ConeTrace,
+    TemporalFilter
 }
 
 [ExecuteInEditMode]
@@ -55,6 +58,8 @@ public class VoxelGI : MonoBehaviour
     public float IndirectLightingConeAngle = 90f;
 
     [Header("Cone Tracing")]
+    [SerializeField]
+    Texture2D BlueNoise_LUT = null;
     [Range(1, 32)]
     public int ScreenMaxStepNum = 32;
     [Range(1.0f, 10.0f)]
@@ -68,6 +73,9 @@ public class VoxelGI : MonoBehaviour
     [Range(20f, 150f)]
     public float ScreenConeAngle = 90f;
 
+    [Header("TemporalFilter")]
+    [Range(0f, 1f)]
+    public float TemporalBlendAlpha = 0.125f;
 
     [Header("Voxel Visualization")]
     public bool DebugMode = false;
@@ -100,7 +108,8 @@ public class VoxelGI : MonoBehaviour
         EPIVoxelization = 0,
         EPIVoxelShadow = 1,
         EPIConeTracing = 2,
-        EPICombine = 3,
+        EPITemporalFilter = 3,
+        EPICombine = 4,
         EPIVoxelizationDebug
     }
 
@@ -166,9 +175,37 @@ public class VoxelGI : MonoBehaviour
     private RenderTexture ConeTracingRT;
     private RenderTextureDescriptor mConeTraceDesc;
 
+    // Temporal
+    private Matrix4x4 PreLocalToWorld;
+    private System.Random mDirRand;
+    private bool mPingPongFlag = false;
+    private RenderTexture ScreenIrradianceRT0;
+    private RenderTexture ScreenIrradianceRT1;
+    private Vector4 mScreenResolution
+    {
+        get
+        {
+            Resolution resolution = Screen.currentResolution;
+            return new Vector4(resolution.width, resolution.height, 1.0f / resolution.width, 1.0f / resolution.height);
+        }
+    }
+
+    private int mConeTraceCount = 0;
+    private double[,] mHemisphere8 = new double[,]{
+        { -0.735927295315164, -0.674169686362497, 0.0625 },
+        { 0.0858751947674414, 0.978503551819642, 0.1875 },
+        { 0.577966879673501, -0.75385544768243, 0.3125 },
+        { -0.885472495182538, 0.156627616578975, 0.4375 },
+        { 0.697614586708622, 0.443765296537886, 0.5625 },
+        { -0.188520590528854, -0.701287200044783, 0.6875 },
+        { -0.26869090798331, 0.517347993102423, 0.8125 },
+        { 0.326869977432545, -0.119372391503427, 0.9375 }
+    };
+    
+
     // computer shader :
     // Lighting
-    ComputeShader  mComputeShader;
+    ComputeShader mComputeShader;
     private RenderTexture UavLighting;
     private RenderTextureDescriptor mLightingDesc;
     RenderTexture mSecondLightingRT;
@@ -196,6 +233,7 @@ public class VoxelGI : MonoBehaviour
         RenderCamera = gameObject.GetComponent<Camera>();
         RenderCamera.depthTextureMode = DepthTextureMode.Depth | DepthTextureMode.DepthNormals | DepthTextureMode.MotionVectors;
         mGiMaterial = new Material(Shader.Find("Hidden/VoxelGI"));
+        mDirRand = new System.Random();
 
         BuildCamera();
         BuildDescripters();
@@ -248,6 +286,7 @@ public class VoxelGI : MonoBehaviour
                 ComputeIndirectLighting();
             }
             ScreenConeTracing();
+            TemporalFilter();
             Combine();
             if (DebugMode)
             {
@@ -287,6 +326,24 @@ public class VoxelGI : MonoBehaviour
 
     #region Util
 
+    public Vector3 GenDirection()
+    {
+        double theta = mDirRand.NextDouble() * 1.57;
+        double fi = mDirRand.NextDouble() * 6.2832;
+        double x = System.Math.Sin(theta) * System.Math.Cos(fi);
+        double y = System.Math.Sin(theta) * System.Math.Sin(fi);
+        double z = System.Math.Cos(theta);
+        Vector3 randVec = new Vector3((float)x, (float)y, (float)z);
+        int id = mConeTraceCount % 8;
+        mConeTraceCount = (mConeTraceCount + 1) % 8;
+        // Vector3 randVec = new Vector3((float)mHemisphere8[id, 0], (float)mHemisphere8[id, 1], (float)mHemisphere8[id, 2]);
+        return randVec;
+    }
+
+    public Vector2 GenRandomUV()
+    {
+        return new Vector2((float)mDirRand.NextDouble(), (float)mDirRand.NextDouble());
+    }
 
     public Matrix4x4 voxelToWorld
     {
@@ -422,8 +479,22 @@ public class VoxelGI : MonoBehaviour
         mLightingPingPongRT = new RenderTexture(mLightingDesc);
         mLightingPingPongRT.Create();
 
-        ConeTracingRT = new RenderTexture(mConeTraceDesc);
-        ConeTracingRT.Create();
+//         ConeTracingRT = new RenderTexture(mConeTraceDesc);
+//         ConeTracingRT.Create();
+
+        ScreenIrradianceRT0 = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+         );
+
+        ScreenIrradianceRT1 = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+         );
 
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
@@ -459,8 +530,17 @@ public class VoxelGI : MonoBehaviour
         mLightingPingPongRT.DiscardContents();
         mLightingPingPongRT.Release();
 
-        ConeTracingRT.DiscardContents();
-        ConeTracingRT.Release();
+        //         ConeTracingRT.DiscardContents();
+        //         ConeTracingRT.Release();
+
+        //         ScreenIrradianceRT0.DiscardContents();
+        //         ScreenIrradianceRT0.Release();
+        // 
+        //         ScreenIrradianceRT1.DiscardContents();
+        //         ScreenIrradianceRT1.Release();
+
+        RenderTexture.ReleaseTemporary(ScreenIrradianceRT0);
+        RenderTexture.ReleaseTemporary(ScreenIrradianceRT1);
 
         DummyTex.DiscardContents();
         DummyTex.Release();
@@ -615,6 +695,12 @@ public class VoxelGI : MonoBehaviour
             0,
             RenderTextureFormat.ARGBHalf
             );
+        ConeTracingRT = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+            );
         mCommandBuffer.Clear();
 
         mCommandBuffer.SetGlobalVector(Shader.PropertyToID("CameraPosW"), RenderCamera.transform.position);
@@ -633,6 +719,7 @@ public class VoxelGI : MonoBehaviour
     {
         RenderTexture.ReleaseTemporary(RTSceneColor);
         RenderTexture.ReleaseTemporary(RTConeTracing);
+        RenderTexture.ReleaseTemporary(ConeTracingRT);
     }
 
     void RenderShodowMap()
@@ -663,8 +750,6 @@ public class VoxelGI : MonoBehaviour
         }
 
         // mCommandBuffer.Blit(ShadowDummy, BuiltinRenderTextureType.CameraTarget);
-
-        //         mCommandBuffer.EndSample("Shadow Mapping");
     }
 
     void RenderVoxel()
@@ -860,14 +945,50 @@ public class VoxelGI : MonoBehaviour
         {
             mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenConeTraceLighting"), UavLighting);
         }
+        
+        Vector3 coneDir = GenDirection();
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ConeTraceDirection"), coneDir);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("RandomUV"), GenRandomUV());
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("NoiseLUT"), BlueNoise_LUT);
         mCommandBuffer.SetRenderTarget(ConeTracingRT);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
-        RenderScreenQuad(RTSceneColor, mGiMaterial, (int)PassIndex.EPIConeTracing);
+        RenderScreenQuad(ConeTracingRT, mGiMaterial, (int)PassIndex.EPIConeTracing);
+    }
+
+    void TemporalFilter()
+    {
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("BlendAlpha"), TemporalBlendAlpha);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("CurrentScreenIrradiance"), ConeTracingRT);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ScreenResolution"), mScreenResolution);
+
+        if (mPingPongFlag)
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("HistoricalScreenIrradiance"), ScreenIrradianceRT0);
+            mCommandBuffer.SetRenderTarget(ScreenIrradianceRT1);
+//             mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+            RenderScreenQuad(ScreenIrradianceRT1, mGiMaterial, (int)PassIndex.EPITemporalFilter);
+        }
+        else
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("HistoricalScreenIrradiance"), ScreenIrradianceRT1);
+            mCommandBuffer.SetRenderTarget(ScreenIrradianceRT0);
+//             mCommandBuffer.ClearRenderTarget(true, true, Color.black);
+            RenderScreenQuad(ScreenIrradianceRT0, mGiMaterial, (int)PassIndex.EPITemporalFilter);
+        }
     }
 
     void Combine()
     {
-        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), RTSceneColor);
+        if (mPingPongFlag)
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT1);
+        }
+        else
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT0);
+        }
+        mPingPongFlag = !mPingPongFlag;
+
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("SceneDirect"), BuiltinRenderTextureType.CameraTarget);
         mCommandBuffer.SetRenderTarget(RTConeTracing);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
@@ -884,6 +1005,15 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexOpacity"), UavOpacity);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexLighting"), UavLighting);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VoxelTexIndirectLighting"), mSecondLightingRT);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenConeTraceIrradiance"), ConeTracingRT);
+        if (mPingPongFlag)
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenBlendIrradiance"), ScreenIrradianceRT0);
+        }
+        else
+        {
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenBlendIrradiance"), ScreenIrradianceRT1);
+        }
 
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("EmissiveMulti"), EmissiveMulti);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("VoxelSize"), VoxelSize);

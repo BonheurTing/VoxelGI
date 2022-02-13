@@ -3,6 +3,7 @@
 #define MOVING_AVERAGE_MAX 255.0
 #define EMISSIVE_SIG_BIT 16
 #define EMISSIVE_EXP_BIT 8
+#define PI 3.1415926
 
 // Voxelization
 float4x4 ObjWorld;
@@ -41,6 +42,8 @@ float HalfPixelSize;
 int EnableConservativeRasterization;
 int DirectLightingDebugMipLevel;
 int IndirectLightingDebugMipLevel;
+sampler2D ScreenConeTraceIrradiance;
+sampler2D ScreenBlendIrradiance;
 // ShadowMapping
 float4x4 WorldToShadowVP;
 SamplerState point_clamp_sampler;
@@ -58,8 +61,19 @@ float ScreenScale;
 float ScreenConeAngle;
 float ScreenFirstStep;
 float ScreenStepScale;
+float3 ConeTraceDirection;
+float2 RandomUV;
+sampler2D NoiseLUT;
+// TAA
+sampler2D _CameraMotionVectorsTexture;
+sampler2D CurrentScreenIrradiance;
+sampler2D HistoricalScreenIrradiance;
+float BlendAlpha;  // this frame
+float4 ScreenResolution;
+// combine
 sampler2D SceneDirect;
 sampler2D VXGIIndirect;
+
 
 #define INDIRECT_CONE_TRACE_MID 1
 
@@ -94,6 +108,23 @@ float3 HslToRgb(float3 c)
 	float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
 	float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
 	return abs(c.z * lerp(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y));
+}
+
+float3 RgbToYcocg(float3 c)
+{
+	float tmp = (c.r + c.b) / 2.0;
+	float y = (c.g + tmp) / 2.0;
+	float co = (c.r - c.b) / 2.0;
+	float cg = (c.g - tmp) / 2.0;
+	return float3(y, co, cg);
+}
+
+float3 YcocgToRgb(float3 c)
+{
+	float r = c.x + c.y - c.z;
+	float g = c.x + c.z;
+	float b = c.x - c.y - c.z;
+	return float3(r, g, b);
 }
 
 uint EncodeGbuffer(float4 value)
@@ -248,6 +279,19 @@ float TextureSDF(float3 position)
 	position = .5f - abs(position - .5f);
 	return min(min(position.x, position.y), position.z);
 }
+
+static half2 NeighborUVNoise[9] =
+{
+	half2(-1.0, -1.0),
+	half2(-1.0, 0.0),
+	half2(-1.0, 1.0),
+	half2(0.0, -1.0),
+	half2(0.0, 1.0),
+	half2(1.0, -1.0),
+	half2(1.0, 0.0),
+	half2(1.0, 1.0),
+	half2(0.0, 0.0),
+};
 
 static float3 Fibonacci_Lattice_Hemisphere_1[1] =
 {
@@ -518,13 +562,13 @@ bool IsInsideVoxelgrid(const float3 p)
 	return abs(p.x) < 1.1f && abs(p.y) < 1.1f && abs(p.z) < 1.1f;
 }
 
-float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
+float4 VoxelizationDebugFs(VoxelizationDebugFsInput fsIn) : SV_Target
 {
 	float4 accumulatedColor = float4(0.f, 0.f, 0.f, 0.f);
 	float fov = tan(CameraFielfOfView * 3.1415926f / 360.f);
-	float3 rayDirView = float3(fov * CameraAspect * (i.uv.x * 2.0f - 1.0f), fov *  (i.uv.y * 2.0f - 1.0f), -1.f);
+	float3 rayDirView = float3(fov * CameraAspect * (fsIn.uv.x * 2.0f - 1.0f), fov *  (fsIn.uv.y * 2.0f - 1.0f), -1.f);
 	float3 rayDirW = normalize(mul((float3x3)CameraInvView, normalize(rayDirView)));
-
+	
 	// float4 posV = mul(CameraInvViewProj, rayPosH)
 
 	int totalSamples = VoxelTextureResolution * VoxelSize  / RayStepSize;
@@ -559,6 +603,12 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput i) : SV_Target
 		case 4: // indirectlighting
 			texSample = VoxelTexIndirectLighting.SampleLevel(linear_clamp_sampler, uvwLerp, IndirectLightingDebugMipLevel);
 			break;
+		case 5: // cone trace
+			float3 traceColor = tex2D(ScreenConeTraceIrradiance, fsIn.uv).rgb;
+			return float4(traceColor, 1.f);
+		case 6:  // TAA
+			float3 blendColor = tex2D(ScreenBlendIrradiance, fsIn.uv).rgb;
+			return float4(blendColor, 1.f);
 		default:
 			break;
 		}
@@ -637,7 +687,7 @@ float3 CalculateScreenIrradiance(float4 voxelPos, float3 normal)
 		coneDir = normalize(mul(coneDir, TangentBasis));
 
 		coordinate = origin + offset * coneDir;
-		int stepNum = 0;
+		stepNum = 0;
 		[loop]
 		while (coneColor.a < 0.95f && TextureSDF(coordinate) > 0.0f && stepNum <= ScreenMaxStepNum)
 		{
@@ -655,6 +705,72 @@ float3 CalculateScreenIrradiance(float4 voxelPos, float3 normal)
 		ndotl = dot(coneDir, normal);
 		resultColor += coneColor * ndotl;
 	}
+
+	return resultColor.xyz;
+}
+
+float2 UniformSampleDiskConcentric(float2 E)
+{
+	float2 p = 2 * E - 1;
+	float Radius;
+	float Phi;
+	if (abs(p.x) > abs(p.y))
+	{
+		Radius = p.x;
+		Phi = (PI / 4) * (p.y / p.x);
+	}
+	else
+	{
+		Radius = p.y;
+		Phi = (PI / 2) - (PI / 4) * (p.x / p.y);
+	}
+	return float2(Radius * cos(Phi), Radius * sin(Phi));
+}
+
+float3 CalculateTemporalScreenIrradiance(float4 voxelPos, float3 normal, float2 hashNoise)
+{
+	if (TextureSDF(voxelPos / VoxelTextureResolution) < 0.0)
+	{
+		return float3(0.f, 0.f, 0.f);
+	}
+
+	normal = normalize(normal);
+	float3 origin = voxelPos / VoxelTextureResolution;
+
+	float3x3 TangentBasis = GetTangentBasis(normal);
+	float coneTan = tan(ScreenConeAngle * 3.14159265f / 360.f);
+	float offset, sampleRadius, step, ndotl;
+	float3 coordinate, coneDir;
+	float4 coneColor, resultColor = float4(0.f, 0.f, 0.f, 0.f);
+	int stepNum = 0;
+
+	coneColor = float4(0.f, 0.f, 0.f, 0.f);
+	step = ScreenFirstStep / VoxelTextureResolution;
+	offset = step;
+	sampleRadius = offset * coneTan;
+
+	coneDir.xy = UniformSampleDiskConcentric(hashNoise);
+	coneDir.z = sqrt(1 - dot(coneDir.xy, coneDir.xy));
+	coneDir = normalize(mul(coneDir, TangentBasis));
+	//return coneDir;
+
+	coordinate = origin + offset * coneDir;
+	[loop]
+	while (coneColor.a < 0.95f && TextureSDF(coordinate) > 0.0f && stepNum <= ScreenMaxStepNum)
+	{
+		float mip = clamp(CalcMipLevel(sampleRadius * VoxelTextureResolution), 0.0, ScreenMaxMipLevel);
+		float4 sampledRadiance = ScreenConeTraceLighting.SampleLevel(linear_clamp_sampler, coordinate, mip);
+		coneColor += (1.f - pow(coneColor.a, ScreenAlphaAtten)) *  sampledRadiance;
+
+		step *= ScreenStepScale;
+		offset += step;
+		sampleRadius = offset * coneTan;
+		coordinate = origin + offset * coneDir;
+		stepNum++;
+	}
+
+	ndotl = dot(coneDir, normal);
+	resultColor = coneColor * ndotl;
 
 	return resultColor.xyz;
 }
@@ -680,12 +796,68 @@ float4 ConeTracingFs(ConeTracingFsInput i) : SV_Target
 	float3 N = tex2D(ScreenNormal, i.uv).xyz;
 	N = normalize(N * 2.f - 1.f);
 
-	float3 screenIrradiance = CalculateScreenIrradiance(float4(voxelPos, 1.f), N);
-
+	// CalculateScreenIrradiance -> CalculateTemporalScreenIrradiance
+	float2 dirNoise = tex2D(NoiseLUT, i.uv+RandomUV).xy;
+	float3 screenIrradiance = CalculateTemporalScreenIrradiance(float4(voxelPos, 1.f), N, dirNoise);
+	//return float4(screenIrradiance, 1.f);
 	float3 albedo = tex2D(ScreenAlbedo, i.uv).xyz;
+	float3 traceColor = screenIrradiance * albedo * ScreenScale;
+	
+    return float4(traceColor, 1.f);
+}
 
-	float3 resultColor = screenIrradiance * albedo * ScreenScale;
+struct TemporalFilterVsInput
+{
+	float3 vertex : POSITION;
+	float2 uv : TEXCOORD0; // 0-1
+};
 
+struct TemporalFilterFsInput
+{
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+TemporalFilterFsInput TemporalFilterVs(TemporalFilterVsInput v)
+{
+	TemporalFilterFsInput o;
+	o.pos = UnityClipToClipPos(float4(v.vertex, 1.f));
+	o.uv = v.uv;
+	return o;
+}
+
+float4 TemporalFilterFs(TemporalFilterFsInput i) : SV_Target
+{
+	float3 traceColor = tex2D(CurrentScreenIrradiance, i.uv).rgb;
+	// get history
+	float2 historicalUV = i.uv - tex2D(_CameraMotionVectorsTexture, i.uv).rg;
+	float3 historicalColor = tex2D(HistoricalScreenIrradiance, historicalUV).rgb;
+
+	// clamp
+	float3 historicalYcocg = RgbToYcocg(historicalColor);
+	float3 minYcocg = float3(1.f, 1.f, 1.f);
+	float3 maxYcocg = float3(0.f, 0.f, 0.f);
+
+	int k;
+	for (k = 0; k < 8; ++k)
+	{
+		float2 neighborUV = i.uv + float2(NeighborUVNoise[k].x * ScreenResolution.z, NeighborUVNoise[k].y * ScreenResolution.w);
+		float3 neighborColor = tex2D(CurrentScreenIrradiance, neighborUV).rgb;
+		float3 neighborYcocg = RgbToYcocg(neighborColor);
+		minYcocg.x = min(minYcocg.x, neighborYcocg.x);
+		minYcocg.y = min(minYcocg.y, neighborYcocg.y);
+		minYcocg.z = min(minYcocg.z, neighborYcocg.z);
+		maxYcocg.x = max(maxYcocg.x, neighborYcocg.x);
+		maxYcocg.y = max(maxYcocg.y, neighborYcocg.y);
+		maxYcocg.z = max(maxYcocg.z, neighborYcocg.z);
+	}
+	historicalYcocg = clamp(historicalYcocg, minYcocg, maxYcocg);
+	historicalColor = YcocgToRgb(historicalYcocg);
+
+	
+	//blend
+	float3 resultColor = BlendAlpha * traceColor + (1 - BlendAlpha) * historicalColor;
+	//return float4(historicalColor, 1.f);
 	return float4(resultColor, 1.f);
 }
 
@@ -713,6 +885,7 @@ float4 CombineFs(CombineFsInput i) : SV_Target
 {
 	float3 sceneColor = tex2D(SceneDirect, i.uv).rgb;
 	float3 vxgiColor = tex2D(VXGIIndirect, i.uv).rgb;
+
 	return float4(sceneColor + vxgiColor, 1.f);
 }
 

@@ -61,6 +61,22 @@
 
 		pass
 		{
+			Name "TemporalFilter"
+
+			Cull Back
+			ZWrite On
+			ZTest Off
+
+			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
+				#pragma target 5.0
+				#pragma vertex TemporalFilterVs
+				#pragma fragment TemporalFilterFs
+			ENDCG
+		}
+
+		pass
+		{
 			Name "Combine"
 
 			Cull Back
