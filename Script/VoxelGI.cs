@@ -24,7 +24,7 @@ public class VoxelGI : MonoBehaviour
     //********************************************************************************************************************************************************************
 
     [Header("Voxelization")]
-    public int ShadowMapResolution = 1024;
+    public int ShadowMapResolution = 8;
     public float ShadowMapRange = 50f;
     public int VoxelTextureResolution = 256;
     public float VoxelSize = 0.25f;
@@ -56,6 +56,8 @@ public class VoxelGI : MonoBehaviour
     public float IndirectLightingStepScale = 1.5f;
     [Range(20f, 150f)]
     public float IndirectLightingConeAngle = 90f;
+    [Range(0, 5)]
+    public int IndirectLightingMinMipLevel = 0;
 
     [Header("Cone Tracing")]
     [SerializeField]
@@ -74,8 +76,11 @@ public class VoxelGI : MonoBehaviour
     public float ScreenConeAngle = 90f;
 
     [Header("TemporalFilter")]
+    public bool EnableTemporalFilter = true;
     [Range(0f, 1f)]
-    public float TemporalBlendAlpha = 0.125f;
+    public float TemporalBlendAlpha = 0.01f;
+    public float ClampAABBScale = 1.5f;
+    public Vector2 BlueNoiseScale = new Vector2(1, 1);
 
     [Header("Voxel Visualization")]
     public bool DebugMode = false;
@@ -176,6 +181,7 @@ public class VoxelGI : MonoBehaviour
     private RenderTextureDescriptor mConeTraceDesc;
 
     // Temporal
+    public int mHaltonValueCount = 8;
     private Matrix4x4 PreLocalToWorld;
     private System.Random mDirRand;
     private bool mPingPongFlag = false;
@@ -189,7 +195,9 @@ public class VoxelGI : MonoBehaviour
             return new Vector4(resolution.width, resolution.height, 1.0f / resolution.width, 1.0f / resolution.height);
         }
     }
+    private Vector4 mBlueNoiseResolution;
 
+    private int mRandomOffsetIndex = 0;
     private int mConeTraceCount = 0;
     private double[,] mHemisphere8 = new double[,]{
         { -0.735927295315164, -0.674169686362497, 0.0625 },
@@ -201,7 +209,6 @@ public class VoxelGI : MonoBehaviour
         { -0.26869090798331, 0.517347993102423, 0.8125 },
         { 0.326869977432545, -0.119372391503427, 0.9375 }
     };
-    
 
     // computer shader :
     // Lighting
@@ -234,6 +241,7 @@ public class VoxelGI : MonoBehaviour
         RenderCamera.depthTextureMode = DepthTextureMode.Depth | DepthTextureMode.DepthNormals | DepthTextureMode.MotionVectors;
         mGiMaterial = new Material(Shader.Find("Hidden/VoxelGI"));
         mDirRand = new System.Random();
+        mBlueNoiseResolution = new Vector4(BlueNoise_LUT.width, BlueNoise_LUT.height, 1.0f / BlueNoise_LUT.width, 1.0f / BlueNoise_LUT.height);
 
         BuildCamera();
         BuildDescripters();
@@ -286,7 +294,10 @@ public class VoxelGI : MonoBehaviour
                 ComputeIndirectLighting();
             }
             ScreenConeTracing();
-            TemporalFilter();
+            if (EnableTemporalFilter)
+            {
+                TemporalFilter();
+            }
             Combine();
             if (DebugMode)
             {
@@ -338,6 +349,29 @@ public class VoxelGI : MonoBehaviour
         mConeTraceCount = (mConeTraceCount + 1) % 8;
         // Vector3 randVec = new Vector3((float)mHemisphere8[id, 0], (float)mHemisphere8[id, 1], (float)mHemisphere8[id, 2]);
         return randVec;
+    }
+
+    private float GetHaltonValue(int index, int radix)
+    {
+        float result = 0f;
+        float fraction = 1f / radix;
+
+        while (index > 0)
+        {
+            result += (index % radix) * fraction;
+            index /= radix;
+            fraction /= radix;
+        }
+        return result;
+    }
+
+    private Vector2 GenerateRandomOffset()
+    {
+        int  count = mHaltonValueCount -1;
+        Vector2 offset = new Vector2(GetHaltonValue(mRandomOffsetIndex, 2), GetHaltonValue(mRandomOffsetIndex, 3));
+        mRandomOffsetIndex++;
+        mRandomOffsetIndex = mRandomOffsetIndex >= count ? 0 : mRandomOffsetIndex;
+        return offset;
     }
 
     public Vector2 GenRandomUV()
@@ -724,6 +758,8 @@ public class VoxelGI : MonoBehaviour
 
     void RenderShodowMap()
     {
+        mCommandBuffer.BeginSample("ShadowMap");
+
         //         mCommandBuffer.BeginSample("Shadow Mapping");
         mCommandBuffer.SetRenderTarget(ShadowDummy, mShadowDepth);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black, 0f);
@@ -750,10 +786,13 @@ public class VoxelGI : MonoBehaviour
         }
 
         // mCommandBuffer.Blit(ShadowDummy, BuiltinRenderTextureType.CameraTarget);
+        mCommandBuffer.EndSample("ShadowMap");
     }
 
     void RenderVoxel()
     {
+        mCommandBuffer.BeginSample("Voxelization");
+
         // cVoxelizationlear 3d gbuffer
         mCommandBuffer.SetRenderTarget(UavAlbedo, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
@@ -802,10 +841,14 @@ public class VoxelGI : MonoBehaviour
         }
 
         mCommandBuffer.ClearRandomWriteTargets();
+
+        mCommandBuffer.EndSample("Voxelization");
     }
 
     void ComputeDirectLighting()
     {
+        mCommandBuffer.BeginSample("Direct Lighting");
+
         mCommandBuffer.SetRenderTarget(UavLighting, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
@@ -850,6 +893,10 @@ public class VoxelGI : MonoBehaviour
 
         mCommandBuffer.ClearRandomWriteTargets();
 
+        mCommandBuffer.EndSample("Direct Lighting");
+
+        mCommandBuffer.BeginSample("Direct Lighting Mipmaping");
+
         // generate direct lighting mipmap
         for (var i = 0; i < mMipLevel - 1; i++)
         {
@@ -873,10 +920,14 @@ public class VoxelGI : MonoBehaviour
 
             CopyTexture3D(mLightingPingPongRT, UavLighting, i + 1);
         }
+        
+        mCommandBuffer.EndSample("Direct Lighting Mipmaping");
     }
 
     void ComputeIndirectLighting()
     {
+        mCommandBuffer.BeginSample("Indirect Lighting");
+
         mCommandBuffer.SetRenderTarget(mSecondLightingRT, 0, CubemapFace.Unknown, -1);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
 
@@ -892,6 +943,7 @@ public class VoxelGI : MonoBehaviour
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingFirstStep", IndirectLightingFirstStep);
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingStepScale", IndirectLightingStepScale);
         mCommandBuffer.SetComputeFloatParam(mComputeShader, "IndirectLightingConeAngle", IndirectLightingConeAngle);
+        mCommandBuffer.SetComputeIntParam(mComputeShader, "IndirectLightingMinMipLevel", IndirectLightingMinMipLevel);
 
         mCommandBuffer.DispatchCompute(
                 mComputeShader,
@@ -900,6 +952,10 @@ public class VoxelGI : MonoBehaviour
                 (int)(VoxelTextureResolution) / 8 + 1,
                 (int)(VoxelTextureResolution) / 8 + 1
                 );
+
+        mCommandBuffer.EndSample("Indirect Lighting");
+
+        mCommandBuffer.BeginSample("Indirect Lighting Mipmaping");
 
         // generate indirect lighting mipmap
         for (var i = 0; i < mMipLevel - 1; i++)
@@ -911,23 +967,28 @@ public class VoxelGI : MonoBehaviour
             mCommandBuffer.SetComputeIntParam(mComputeShader, "SrcMipLevel", i);
             mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapSrc"), mSecondLightingRT);
             mCommandBuffer.SetComputeTextureParam(mComputeShader, mComputeKernelIdMipmap, Shader.PropertyToID("MipmapDst"), mLightingPingPongRT, i + 1);
-
+            
+            //mCommandBuffer.SetComputeIntParam(mComputeShader, "MipmapDimension", j);
             mCommandBuffer.DispatchCompute(
-                mComputeShader,
-                mComputeKernelIdMipmap,
-                groupNum,
-                groupNum,
-                groupNum
-                );
+            mComputeShader,
+            mComputeKernelIdMipmap,
+            groupNum,
+            groupNum,
+            groupNum
+            );
 
             mCommandBuffer.ClearRandomWriteTargets();
 
             CopyTexture3D(mLightingPingPongRT, mSecondLightingRT, i + 1);
         }
+
+        mCommandBuffer.EndSample("Indirect Lighting Mipmaping");
     }
 
     void ScreenConeTracing()
     {
+        mCommandBuffer.BeginSample("Cone Tracing");
+
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenMaxMipLevel"), mMipLevel);
         mCommandBuffer.SetGlobalInt(Shader.PropertyToID("ScreenMaxStepNum"), ScreenMaxStepNum);
         mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("ScreenAlphaAtten"), ScreenAlphaAtten);
@@ -946,21 +1007,29 @@ public class VoxelGI : MonoBehaviour
             mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("ScreenConeTraceLighting"), UavLighting);
         }
         
-        Vector3 coneDir = GenDirection();
-        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ConeTraceDirection"), coneDir);
-        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("RandomUV"), GenRandomUV());
+        //Vector3 coneDir = GenDirection();
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("EnableTemporalFilter"), EnableTemporalFilter ? 1 : 0);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ScreenResolution"), mScreenResolution);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("BlueNoiseResolution"), mBlueNoiseResolution);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("BlueNoiseScale"), new Vector4(BlueNoiseScale.x, BlueNoiseScale.y, 1f / BlueNoiseScale.x, 1f / BlueNoiseScale.y));
+        //mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ConeTraceDirection"), coneDir);
+        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("RandomUV"), GenerateRandomOffset()); // GenRandomUV
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("NoiseLUT"), BlueNoise_LUT);
         mCommandBuffer.SetRenderTarget(ConeTracingRT);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
         RenderScreenQuad(ConeTracingRT, mGiMaterial, (int)PassIndex.EPIConeTracing);
+
+        mCommandBuffer.EndSample("Cone Tracing");
     }
 
     void TemporalFilter()
     {
-        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("BlendAlpha"), TemporalBlendAlpha);
-        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("CurrentScreenIrradiance"), ConeTracingRT);
-        mCommandBuffer.SetGlobalVector(Shader.PropertyToID("ScreenResolution"), mScreenResolution);
+        mCommandBuffer.BeginSample("Temporal Filtering");
 
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("BlendAlpha"), TemporalBlendAlpha);
+        mCommandBuffer.SetGlobalFloat(Shader.PropertyToID("TemporalClampAABBScale"), ClampAABBScale);
+        mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("CurrentScreenIrradiance"), ConeTracingRT);
+        
         if (mPingPongFlag)
         {
             mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("HistoricalScreenIrradiance"), ScreenIrradianceRT0);
@@ -975,25 +1044,40 @@ public class VoxelGI : MonoBehaviour
 //             mCommandBuffer.ClearRenderTarget(true, true, Color.black);
             RenderScreenQuad(ScreenIrradianceRT0, mGiMaterial, (int)PassIndex.EPITemporalFilter);
         }
+        
+        mCommandBuffer.EndSample("Temporal Filtering");
     }
 
     void Combine()
     {
-        if (mPingPongFlag)
+        mCommandBuffer.BeginSample("Combine");
+
+        if (EnableTemporalFilter)
         {
-            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT1);
+            if (mPingPongFlag)
+            {
+                mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT1);
+            }
+            else
+            {
+                mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT0);
+            }
+            mPingPongFlag = !mPingPongFlag;
         }
         else
         {
-            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ScreenIrradianceRT0);
+            mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("VXGIIndirect"), ConeTracingRT);
         }
-        mPingPongFlag = !mPingPongFlag;
 
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("EnableTemporalFilter"), EnableTemporalFilter ? 1 : 0);
+        mCommandBuffer.SetGlobalInt(Shader.PropertyToID("TemporalFrameCount"), 4);
         mCommandBuffer.SetGlobalTexture(Shader.PropertyToID("SceneDirect"), BuiltinRenderTextureType.CameraTarget);
         mCommandBuffer.SetRenderTarget(RTConeTracing);
         mCommandBuffer.ClearRenderTarget(true, true, Color.black);
         RenderScreenQuad(RTConeTracing, mGiMaterial, (int)PassIndex.EPICombine);
         Blit(RTConeTracing, BuiltinRenderTextureType.CameraTarget);
+
+        mCommandBuffer.EndSample("Combine");
     }
 
     void RenderDebug()

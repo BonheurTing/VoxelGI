@@ -5,6 +5,8 @@
 #define EMISSIVE_EXP_BIT 8
 #define PI 3.1415926
 
+#define USE_YCOCG_CLAMP 1
+
 // Voxelization
 float4x4 ObjWorld;
 float4x4  VoxelizationForwardVP;
@@ -48,6 +50,8 @@ sampler2D ScreenBlendIrradiance;
 float4x4 WorldToShadowVP;
 SamplerState point_clamp_sampler;
 SamplerState linear_clamp_sampler;
+SamplerState sampler_point_repeat;
+SamplerState sampler_linear_repeat;
 // Cone Tracing
 sampler2D _CameraDepthTexture;
 sampler2D _CameraDepthNormalsTexture;
@@ -61,18 +65,25 @@ float ScreenScale;
 float ScreenConeAngle;
 float ScreenFirstStep;
 float ScreenStepScale;
+int EnableTemporalFilter;
 float3 ConeTraceDirection;
 float2 RandomUV;
-sampler2D NoiseLUT;
-// TAA
+Texture2D NoiseLUT;
+float4 ScreenResolution;
+float4 BlueNoiseResolution;
+float4 BlueNoiseScale;
+// Temporal Filter
 sampler2D _CameraMotionVectorsTexture;
 sampler2D CurrentScreenIrradiance;
 sampler2D HistoricalScreenIrradiance;
 float BlendAlpha;  // this frame
-float4 ScreenResolution;
+float TemporalClampAABBScale;
+//float4 ScreenResolution;
 // combine
+//int EnableTemporalFilter;
 sampler2D SceneDirect;
 sampler2D VXGIIndirect;
+int TemporalFrameCount;
 
 
 #define INDIRECT_CONE_TRACE_MID 1
@@ -606,7 +617,7 @@ float4 VoxelizationDebugFs(VoxelizationDebugFsInput fsIn) : SV_Target
 		case 5: // cone trace
 			float3 traceColor = tex2D(ScreenConeTraceIrradiance, fsIn.uv).rgb;
 			return float4(traceColor, 1.f);
-		case 6:  // TAA
+		case 6: // TAA
 			float3 blendColor = tex2D(ScreenBlendIrradiance, fsIn.uv).rgb;
 			return float4(blendColor, 1.f);
 		default:
@@ -705,6 +716,7 @@ float3 CalculateScreenIrradiance(float4 voxelPos, float3 normal)
 		ndotl = dot(coneDir, normal);
 		resultColor += coneColor * ndotl;
 	}
+	//resultColor /= CONE_COUNT;
 
 	return resultColor.xyz;
 }
@@ -796,9 +808,17 @@ float4 ConeTracingFs(ConeTracingFsInput i) : SV_Target
 	float3 N = tex2D(ScreenNormal, i.uv).xyz;
 	N = normalize(N * 2.f - 1.f);
 
-	// CalculateScreenIrradiance -> CalculateTemporalScreenIrradiance
-	float2 dirNoise = tex2D(NoiseLUT, i.uv+RandomUV).xy;
-	float3 screenIrradiance = CalculateTemporalScreenIrradiance(float4(voxelPos, 1.f), N, dirNoise);
+	float3 screenIrradiance;
+	if (EnableTemporalFilter > 0)
+	{
+		float2 noiseUV = (i.uv * ScreenResolution.xy * BlueNoiseResolution.zw * BlueNoiseScale.xy) + RandomUV;
+		float2 dirNoise = NoiseLUT.SampleLevel(sampler_point_repeat, noiseUV, 0).xy;
+		screenIrradiance = CalculateTemporalScreenIrradiance(float4(voxelPos, 1.f), N, dirNoise);
+	}
+	else
+	{
+		screenIrradiance = CalculateScreenIrradiance(float4(voxelPos, 1.f), N);
+	}
 	//return float4(screenIrradiance, 1.f);
 	float3 albedo = tex2D(ScreenAlbedo, i.uv).xyz;
 	float3 traceColor = screenIrradiance * albedo * ScreenScale;
@@ -830,33 +850,36 @@ float4 TemporalFilterFs(TemporalFilterFsInput i) : SV_Target
 {
 	float3 traceColor = tex2D(CurrentScreenIrradiance, i.uv).rgb;
 	// get history
-	float2 historicalUV = i.uv - tex2D(_CameraMotionVectorsTexture, i.uv).rg;
+	float2 velocity = tex2D(_CameraMotionVectorsTexture, i.uv).rg;
+	float2 historicalUV = i.uv - velocity;
 	float3 historicalColor = tex2D(HistoricalScreenIrradiance, historicalUV).rgb;
 
 	// clamp
-	float3 historicalYcocg = RgbToYcocg(historicalColor);
-	float3 minYcocg = float3(1.f, 1.f, 1.f);
+#if USE_YCOCG_CLAMP
+	historicalColor = RgbToYcocg(historicalColor);
+#endif
+	float3 minYcocg = float3(99999.f, 99999.f, 99999.f);
 	float3 maxYcocg = float3(0.f, 0.f, 0.f);
 
 	int k;
-	for (k = 0; k < 8; ++k)
+	for (k = 0; k < 9; ++k)
 	{
 		float2 neighborUV = i.uv + float2(NeighborUVNoise[k].x * ScreenResolution.z, NeighborUVNoise[k].y * ScreenResolution.w);
 		float3 neighborColor = tex2D(CurrentScreenIrradiance, neighborUV).rgb;
-		float3 neighborYcocg = RgbToYcocg(neighborColor);
-		minYcocg.x = min(minYcocg.x, neighborYcocg.x);
-		minYcocg.y = min(minYcocg.y, neighborYcocg.y);
-		minYcocg.z = min(minYcocg.z, neighborYcocg.z);
-		maxYcocg.x = max(maxYcocg.x, neighborYcocg.x);
-		maxYcocg.y = max(maxYcocg.y, neighborYcocg.y);
-		maxYcocg.z = max(maxYcocg.z, neighborYcocg.z);
+#if USE_YCOCG_CLAMP
+		neighborColor = RgbToYcocg(neighborColor);
+#endif
+		minYcocg = min(minYcocg, neighborColor);
+		maxYcocg = max(maxYcocg, neighborColor);
 	}
-	historicalYcocg = clamp(historicalYcocg, minYcocg, maxYcocg);
-	historicalColor = YcocgToRgb(historicalYcocg);
+	historicalColor = clamp(historicalColor, minYcocg * rcp(TemporalClampAABBScale), maxYcocg * TemporalClampAABBScale);
+#if USE_YCOCG_CLAMP
+	historicalColor = YcocgToRgb(historicalColor);
+#endif
 
-	
 	//blend
-	float3 resultColor = BlendAlpha * traceColor + (1 - BlendAlpha) * historicalColor;
+	BlendAlpha = 1.f - saturate((1.f - BlendAlpha) * (1 - length(velocity) * 10));
+	float3 resultColor = lerp(historicalColor, traceColor, BlendAlpha);
 	//return float4(historicalColor, 1.f);
 	return float4(resultColor, 1.f);
 }
@@ -886,6 +909,14 @@ float4 CombineFs(CombineFsInput i) : SV_Target
 	float3 sceneColor = tex2D(SceneDirect, i.uv).rgb;
 	float3 vxgiColor = tex2D(VXGIIndirect, i.uv).rgb;
 
-	return float4(sceneColor + vxgiColor, 1.f);
+	if (EnableTemporalFilter)
+	{
+		return float4(sceneColor + vxgiColor * TemporalFrameCount, 1.f);
+	}
+	else
+	{
+		return float4(sceneColor + vxgiColor, 1.f);
+	}
+	
 }
 
