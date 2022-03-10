@@ -1,15 +1,16 @@
 ﻿// Each #kernel tells which function to compile; you can have many kernels
 
-#pragma enable_d3d11_debug_symbols
+#include "UnityCG.cginc"
+
+//#pragma enable_d3d11_debug_symbols
 #pragma kernel VoxelDirectLighting
 #pragma kernel MipmapGeneration
 #pragma kernel CopyTexture3D
 #pragma kernel VoxelIndirectLighting
+#pragma kernel BilateralFiltering
 
 #define ENABLE_SHADOW_SUN_BIAS 1
 #define ENABLE_SHADOW_NORMAL_BIAS 1
-
-//#define RADIANCE_POINT_SAMPLER
 
 Texture3D<uint> RWAlbedo;
 Texture3D<uint> RWNormal;
@@ -23,11 +24,9 @@ float4x4 gWorldToVoxel;
 float gVoxelTextureResolution;
 float gVoxelSize;
 
-// todo enable second bounce
-
-//------------------------------------------------------------------------------------------------------
-// Util
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
+// Util.
+//********************************************************************************************************************************************************************
 
 uint EncodeGbuffer(float4 value)
 {
@@ -102,17 +101,108 @@ static float3 Fibonacci_Lattice_Hemisphere_16[16] =
 	float3(0.189662913959254, -0.159848104675922, 0.96875),
 };
 
-//------------------------------------------------------------------------------------------------------
-// Generate Mipmap.
-//------------------------------------------------------------------------------------------------------
-/*
-static float Weights[4] = {
-  0.125,
-  0.0625,
-  0.03125,
-  0.015625
+static float Gauss_Kernel_2[2] =
+{
+	0.451863,
+	0.274069
 };
-*/
+
+static float Gauss_Kernel_3[3] =
+{
+	0.317181,
+	0.198238,
+	0.114537
+};
+
+static float Gauss_Kernel_4[4] =
+{
+	0.216106,
+	0.190713,
+	0.131075,
+	0.070159
+};
+
+static int2 PoissonStartAndEnd[] =
+{
+int2(0,  1),
+int2(1,  3),
+int2(3,  7),
+int2(7, 15),
+int2(15, 31),
+int2(31, 63),
+};
+
+static const float2 PoissonDisk[] =
+{
+float2(0.402211,  0.126575),
+float2(0.297056,  0.616830),
+float2(0.298156, -0.001704),
+float2(0.019369,  0.395482),
+float2(-0.066918, -0.367739),
+float2(-0.955010,  0.372377),
+float2(0.800057,  0.120602),
+float2(-0.7494944, 0.1827986),
+float2(-0.8572887, -0.4169083),
+float2(-0.1087135, -0.05238153),
+float2(0.1045462, 0.9657645),
+float2(-0.0135659, -0.698451),
+float2(-0.4942278, 0.7898396),
+float2(0.7970678, -0.4682421),
+float2(0.8084122, 0.533884),
+float2(0.4036454, -0.793536),
+float2(0.3826454, -0.2730118),
+float2(-0.04124885, -0.5971786),
+float2(-0.3709261, -0.9179904),
+float2(-0.3795351, -0.3353493),
+float2(-0.3154466, 0.1069074),
+float2(-0.7671808, -0.6143452),
+float2(-0.4865215, 0.6395131),
+float2(0.2359872, 0.1510548),
+float2(0.03092861, 0.7309022),
+float2(-0.82846, -0.1055831),
+float2(-0.8732378, 0.3034171),
+float2(0.9268684, -0.116035),
+float2(0.6980102, 0.3764873),
+float2(0.8239923, -0.515003),
+float2(0.5084407, 0.7533528),
+float2(-0.975402, -0.0711386),
+float2(-0.920347, -0.41142),
+float2(-0.883908, 0.217872),
+float2(-0.884518, 0.568041),
+float2(-0.811945, 0.90521),
+float2(-0.792474, -0.779962),
+float2(-0.614856, 0.386578),
+float2(-0.580859, -0.208777),
+float2(-0.53795, 0.716666),
+float2(-0.515427, 0.0899991),
+float2(-0.454634, -0.707938),
+float2(-0.420942, 0.991272),
+float2(-0.261147, 0.588488),
+float2(-0.211219, 0.114841),
+float2(-0.146336, -0.259194),
+float2(-0.139439, -0.888668),
+float2(0.0116886, 0.326395),
+float2(0.0380566, 0.625477),
+float2(0.0625935, -0.50853),
+float2(0.125584, 0.0469069),
+float2(0.169469, -0.997253),
+float2(0.320597, 0.291055),
+float2(0.359172, -0.633717),
+float2(0.435713, -0.250832),
+float2(0.507797, -0.916562),
+float2(0.545763, 0.730216),
+float2(0.56859, 0.11655),
+float2(0.743156, -0.505173),
+float2(0.736442, -0.189734),
+float2(0.843562, 0.357036),
+float2(0.865413, 0.763726),
+float2(0.872005, -0.927)
+};
+
+//********************************************************************************************************************************************************************
+// Generate Mipmap.
+//********************************************************************************************************************************************************************
+
 uint DstRes;
 uint SrcMipLevel;
 Texture3D<float4> MipmapSrc;
@@ -221,9 +311,9 @@ void MipmapGeneration(uint3 groupId : SV_GroupThreadID,
 	
 }
 
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 // Copy Texture 3D.
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 
 uint CopyMipLevel;
 Texture3D<float4> TexSrc;
@@ -236,24 +326,18 @@ void CopyTexture3D(uint3 id : SV_DispatchThreadID)
 	TexDst[id.xyz] = sampled;
 }
 
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 // Calculate Voxel Direct Lighting.
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 
 float3 SunLightColor;
 float3 SunLightDir;
 float SunLightIntensity;
-
 float LightIndensityMulti = 1.0f;
 float EmissiveMulti = 1.0f;
-
 float4x4 gWorldToShadowVP;
-
 float ShadowSunBias;
 float ShadowNormalBias;
-
-// Create a RenderTexture with enableRandomWrite flag and set it
-// with cs.SetTexture
 RWTexture3D<half4> OutRadiance;
 
 [numthreads(4,4,4)]
@@ -300,17 +384,14 @@ void VoxelDirectLighting(uint3 id : SV_DispatchThreadID)
 	OutRadiance[id.xyz] = float4(resColor, opacity);
 }
 
-
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 // Calculate Voxel Indirect Lighting.
-//------------------------------------------------------------------------------------------------------
+//********************************************************************************************************************************************************************
 
 SamplerState point_clamp_sampler;
 SamplerState linear_clamp_sampler;
 Texture3D<float4> VoxelLighting;
-
 RWTexture3D<half4> OutIndirectRadiance;
-
 float IndirectLightingMaxMipLevel;
 int IndirectLightingMaxStepNum;
 float IndirectLightingAlphaAtten;
@@ -426,4 +507,77 @@ void VoxelIndirectLighting(uint3 id : SV_DispatchThreadID)
 	float3 resultColor = directColor + voxelIrradiance * albedo * IndirectLightingScale;
 
 	OutIndirectRadiance[id.xyz] = float4(resultColor, opacity);
+}
+
+//********************************************************************************************************************************************************************
+// Bilateral Filtering.
+//********************************************************************************************************************************************************************
+
+sampler2D WholeIndirectLight;
+sampler2D _CameraDepthNormalsTexture;
+float4 ScreenResolution;
+float SampleRadius;
+float4 BilaterialThreshold;
+float NearClip;
+float FarClip;
+RWTexture2D<float4> OutBilateralFilter;
+
+#define DepthThresholdLowerBound BilaterialThreshold.x
+#define DepthThresholdUpperBound BilaterialThreshold.y
+#define NormalThresholdLowerBound BilaterialThreshold.z
+#define NormalThresholdUpperBound BilaterialThreshold.w
+
+#define BILATERAL_FILTER_MID 1
+
+#if BILATERAL_FILTER_LOW
+#define POISSION_SIZE 2
+#elif BILATERAL_FILTER_MID
+#define POISSION_SIZE 3
+#elif BILATERAL_FILTER_HIGH
+#define POISSION_SIZE 4
+#endif
+
+void DecodeWorldNormalAndViewDepth(inout float3 normal, inout float depth)
+{
+	float4x4 viewTranspose = transpose(UNITY_MATRIX_V);
+	normal = mul(viewTranspose, float4(normal.xyz, 0)).xyz;
+	depth = depth * (FarClip - NearClip) + NearClip;
+}
+
+[numthreads(8, 8, 1)]
+void BilateralFiltering(uint3 id : SV_DispatchThreadID)
+{
+	float2 uv = (id.xy + 0.5f)*ScreenResolution.zw;
+
+	float4 centerDepthNormal = tex2Dlod(_CameraDepthNormalsTexture, float4(uv, 0, 0));
+	float3 centerNormal;
+	float centerDepth;
+	DecodeDepthNormal(centerDepthNormal, centerDepth, centerNormal);
+	DecodeWorldNormalAndViewDepth(centerNormal, centerDepth);
+
+	float4 color = tex2Dlod(WholeIndirectLight, float4(uv, 0, 0));
+	float totalWeight = 1.f;
+	float SampleNum = PoissonStartAndEnd[POISSION_SIZE].y - PoissonStartAndEnd[POISSION_SIZE].x;
+	for (int i = PoissonStartAndEnd[POISSION_SIZE].x; i < PoissonStartAndEnd[POISSION_SIZE].y; ++i)
+	{
+		float2 deltUv = PoissonDisk[i] * SampleRadius * ScreenResolution.zw;
+		float4 depthnormal = tex2Dlod(_CameraDepthNormalsTexture, float4(uv+ deltUv, 0, 0));
+		float3 sampledNormal;
+		float sampledDepth;
+		DecodeDepthNormal(depthnormal, sampledDepth, sampledNormal);
+		DecodeWorldNormalAndViewDepth(sampledNormal, sampledDepth);
+
+		float weight = 1.f - saturate((abs(sampledDepth - centerDepth) - DepthThresholdLowerBound)
+			/ (DepthThresholdUpperBound - DepthThresholdLowerBound));
+		weight *= saturate((dot(sampledNormal, centerNormal) - NormalThresholdLowerBound)
+			/ (NormalThresholdUpperBound - NormalThresholdLowerBound));
+
+		float4 sampled = tex2Dlod(WholeIndirectLight, float4(uv+ deltUv, 0, 0));
+		color += sampled * weight;
+		totalWeight += weight;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	OutBilateralFilter[id.xy] = float4(color.xyz / totalWeight, 1.f);
 }

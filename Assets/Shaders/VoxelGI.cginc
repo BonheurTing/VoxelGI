@@ -4,7 +4,6 @@
 #define EMISSIVE_SIG_BIT 16
 #define EMISSIVE_EXP_BIT 8
 #define PI 3.1415926
-
 #define USE_YCOCG_CLAMP 1
 
 // Voxelization
@@ -31,27 +30,14 @@ float CameraAspect;
 int VoxelTextureResolution;
 float VoxelSize;
 float RayStepSize; // 0.5  --- < for 100
-// debug
-Texture3D<uint> VoxelTexAlbedo;
-Texture3D<uint> VoxelTexNormal;
-Texture3D<uint> VoxelTexEmissive;
-Texture3D<uint> VoxelTexOpacity;
-Texture3D<half4> VoxelTexLighting;
-Texture3D<half4> VoxelTexIndirectLighting;
-float EmissiveMulti;
-int VisualizeDebugType;
-float HalfPixelSize;
-int EnableConservativeRasterization;
-int DirectLightingDebugMipLevel;
-int IndirectLightingDebugMipLevel;
-sampler2D ScreenConeTraceIrradiance;
-sampler2D ScreenBlendIrradiance;
-// ShadowMapping
+
+// Shadowmapping
 float4x4 WorldToShadowVP;
 SamplerState point_clamp_sampler;
 SamplerState linear_clamp_sampler;
 SamplerState sampler_point_repeat;
 SamplerState sampler_linear_repeat;
+
 // Cone Tracing
 sampler2D _CameraDepthTexture;
 sampler2D _CameraDepthNormalsTexture;
@@ -72,37 +58,40 @@ Texture2D NoiseLUT;
 float4 ScreenResolution;
 float4 BlueNoiseResolution;
 float4 BlueNoiseScale;
+
 // Temporal Filter
 sampler2D _CameraMotionVectorsTexture;
 sampler2D CurrentScreenIrradiance;
 sampler2D HistoricalScreenIrradiance;
 float BlendAlpha;  // this frame
 float TemporalClampAABBScale;
-//float4 ScreenResolution;
-// combine
-//int EnableTemporalFilter;
+
+// Combine
 sampler2D SceneDirect;
 sampler2D VXGIIndirect;
 int TemporalFrameCount;
 
+// Debug
+Texture3D<uint> VoxelTexAlbedo;
+Texture3D<uint> VoxelTexNormal;
+Texture3D<uint> VoxelTexEmissive;
+Texture3D<uint> VoxelTexOpacity;
+Texture3D<half4> VoxelTexLighting;
+Texture3D<half4> VoxelTexIndirectLighting;
+float EmissiveMulti;
+int VisualizeDebugType;
+float HalfPixelSize;
+int EnableConservativeRasterization;
+int DirectLightingDebugMipLevel;
+int IndirectLightingDebugMipLevel;
+sampler2D ScreenConeTraceIrradiance;
+sampler2D ScreenBlendIrradiance;
+sampler2D ScreenBilateralFiltering;
 
-#define INDIRECT_CONE_TRACE_MID 1
+//********************************************************************************************************************************************************************
+// Util.
+//********************************************************************************************************************************************************************
 
-#if INDIRECT_CONE_TRACE_VERY_LOW
-#define CONE_COUNT 1
-#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_1
-#elif INDIRECT_CONE_TRACE_LOW
-#define CONE_COUNT 4
-#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_4
-#elif INDIRECT_CONE_TRACE_MID
-#define CONE_COUNT 8
-#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_8
-#elif INDIRECT_CONE_TRACE_HIGH
-#define CONE_COUNT 16
-#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_16
-#endif
-
-// Util
 float3 RgbToHsl(float3 c)
 {
 	float4 K = float4(0.0f, -1.0f / 3.0f, 2.0f / 3.0f, -1.0f);
@@ -349,14 +338,21 @@ static float3 Fibonacci_Lattice_Hemisphere_16[16] =
 	float3(0.189662913959254, -0.159848104675922, 0.96875),
 };
 
-// Voxelization
+bool IsInsideVoxelgrid(const float3 p)
+{
+	return abs(p.x) < 1.1f && abs(p.y) < 1.1f && abs(p.z) < 1.1f;
+}
+
+//********************************************************************************************************************************************************************
+// Voxelization.
+//********************************************************************************************************************************************************************
+
 struct VoxelizationVsInput
 {
 	float4 vertex : POSITION;
 	float3 normal : NORMAL;
 	float2 uv : TEXCOORD0;
 };
-
 
 struct VoxelizationGsInput
 {
@@ -526,17 +522,17 @@ half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 			discard;
 		}
 	}
-	// pbr
+
 	float4 albedo = tex2Dlod(ObjAlbedo, float4(i.uv,0,0));
 	i.normal = (i.normal + float3(1.f, 1.f, 1.f)) / 2.f;
 	float4 normalA = float4(i.normal, albedo.a);
 	float4 emissive = tex2Dlod(ObjEmissive, float4(i.uv, 0, 0));
-	//emissive.a = albedo.a;
 	float4 opacity = float4(albedo.a, 0.f, 0.f, albedo.a);
 
-	// calculate the 3d tecture index
+	// calculate the 3d texture index
 	float4 posV = mul(WorldToVoxel, i.posW);
 	int3 uvw = int3(posV.xyz);
+
 	// store the fragment in our 3d texture using a moving average
 	MovingAverage(OutAlbedo, uvw, albedo, 0);
 	MovingAverage(OutNormal, uvw, normalA, 1);
@@ -546,99 +542,9 @@ half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 	return half4(1.f, 0.f, 0.f, 1.0f);
 }
 
-// Debug
-
-struct VoxelizationDebugVsInput
-{
-	float3 vertex : POSITION;
-	float2 uv : TEXCOORD0; // 0-1
-};
-
-struct VoxelizationDebugFsInput
-{
-	float4 pos : SV_POSITION;
-	float2 uv : TEXCOORD0;
-};
-
-VoxelizationDebugFsInput VoxelizationDebugVs(VoxelizationVsInput v)
-{
-	VoxelizationDebugFsInput o;
-	o.pos = UnityClipToClipPos(v.vertex);
-	o.uv = v.uv;
-	return o;
-}
-
-bool IsInsideVoxelgrid(const float3 p)
-{
-	return abs(p.x) < 1.1f && abs(p.y) < 1.1f && abs(p.z) < 1.1f;
-}
-
-float4 VoxelizationDebugFs(VoxelizationDebugFsInput fsIn) : SV_Target
-{
-	float4 accumulatedColor = float4(0.f, 0.f, 0.f, 0.f);
-	float fov = tan(CameraFielfOfView * 3.1415926f / 360.f);
-	float3 rayDirView = float3(fov * CameraAspect * (fsIn.uv.x * 2.0f - 1.0f), fov *  (fsIn.uv.y * 2.0f - 1.0f), -1.f);
-	float3 rayDirW = normalize(mul((float3x3)CameraInvView, normalize(rayDirView)));
-	
-	// float4 posV = mul(CameraInvViewProj, rayPosH)
-
-	int totalSamples = VoxelTextureResolution * VoxelSize  / RayStepSize;
-	[loop]
-	for (int i = 0; i < totalSamples; ++i)
-	{
-		float4 rayWorld = float4(CameraPosW + rayDirW * RayStepSize * i, 1.f);
-		float3 uvwLerp = mul(WorldToVoxel, rayWorld).xyz;
-		uint3 uvw = uvwLerp; // VoxelTextureResolution;
-		uvwLerp /= VoxelTextureResolution;
-		float opacity = DecodeGbuffer(VoxelTexOpacity[uvw]).x;
-		float4 texSample = float4(0.f, 0.f, 0.f, 0.f);
-		switch (VisualizeDebugType)
-		{
-		case 0: // albedo
-			texSample = DecodeGbuffer(VoxelTexAlbedo[uvw]);
-			texSample.a = opacity;
-			break;
-		case 1: // normal
-			texSample = DecodeGbuffer(VoxelTexNormal[uvw]);
-			texSample.rgb = (texSample.rgb * 2.f) - float3(1.f, 1.f, 1.f);
-			texSample.a = opacity;
-			break;
-		case 2: // emissive
-			texSample = DecodeGbuffer(VoxelTexEmissive[uvw]);
-			texSample.rgb *= EmissiveMulti;
-			texSample.a = opacity;
-			break;
-		case 3: // lighting
-			texSample = VoxelTexLighting.SampleLevel(linear_clamp_sampler, uvwLerp, DirectLightingDebugMipLevel);
-			break;
-		case 4: // indirectlighting
-			texSample = VoxelTexIndirectLighting.SampleLevel(linear_clamp_sampler, uvwLerp, IndirectLightingDebugMipLevel);
-			break;
-		case 5: // cone trace
-			float3 traceColor = tex2D(ScreenConeTraceIrradiance, fsIn.uv).rgb;
-			return float4(traceColor, 1.f);
-		case 6: // TAA
-			float3 blendColor = tex2D(ScreenBlendIrradiance, fsIn.uv).rgb;
-			return float4(blendColor, 1.f);
-		default:
-			break;
-		}
-
-		if (texSample.a > 0.0001f)
-		{
-			accumulatedColor.rgb = accumulatedColor.rgb + (1.f - accumulatedColor.a) * texSample.rgb;
-			accumulatedColor.a = accumulatedColor.a + (1.f - accumulatedColor.a) * texSample.a;
-		}
-
-		if (accumulatedColor.a > 0.95f)
-		{
-			break;
-		}
-	}
-	return accumulatedColor;
-}
-
-// Shadow Mapping
+//********************************************************************************************************************************************************************
+// Shadow Mapping.
+//********************************************************************************************************************************************************************
 
 struct ShadowFsInput
 {
@@ -658,7 +564,25 @@ float ShadowFs(ShadowFsInput i) : SV_Target
 	return i.vertex.z;
 }
 
-// Cone Tracing
+//********************************************************************************************************************************************************************
+// Cone Tracing.
+//********************************************************************************************************************************************************************
+
+#define INDIRECT_CONE_TRACE_MID 1
+#if INDIRECT_CONE_TRACE_VERY_LOW
+#define CONE_COUNT 1
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_1
+#elif INDIRECT_CONE_TRACE_LOW
+#define CONE_COUNT 4
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_4
+#elif INDIRECT_CONE_TRACE_MID
+#define CONE_COUNT 8
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_8
+#elif INDIRECT_CONE_TRACE_HIGH
+#define CONE_COUNT 16
+#define Fibonacci_Lattice_Hemisphere Fibonacci_Lattice_Hemisphere_16
+#endif
+
 struct ConeTracingVsInput
 {
 	float3 vertex : POSITION;
@@ -826,6 +750,10 @@ float4 ConeTracingFs(ConeTracingFsInput i) : SV_Target
     return float4(traceColor, 1.f);
 }
 
+//********************************************************************************************************************************************************************
+// Temporal Filter.
+//********************************************************************************************************************************************************************
+
 struct TemporalFilterVsInput
 {
 	float3 vertex : POSITION;
@@ -849,6 +777,7 @@ TemporalFilterFsInput TemporalFilterVs(TemporalFilterVsInput v)
 float4 TemporalFilterFs(TemporalFilterFsInput i) : SV_Target
 {
 	float3 traceColor = tex2D(CurrentScreenIrradiance, i.uv).rgb;
+
 	// get history
 	float2 velocity = tex2D(_CameraMotionVectorsTexture, i.uv).rg;
 	float2 historicalUV = i.uv - velocity;
@@ -878,11 +807,14 @@ float4 TemporalFilterFs(TemporalFilterFsInput i) : SV_Target
 #endif
 
 	//blend
-	BlendAlpha = 1.f - saturate((1.f - BlendAlpha) * (1 - length(velocity) * 10));
+	BlendAlpha = 1.f - saturate((1.f - BlendAlpha) * (1 - length(velocity) * 30));
 	float3 resultColor = lerp(historicalColor, traceColor, BlendAlpha);
-	//return float4(historicalColor, 1.f);
 	return float4(resultColor, 1.f);
 }
+
+//********************************************************************************************************************************************************************
+// Combine.
+//********************************************************************************************************************************************************************
 
 struct CombineVsInput
 {
@@ -917,6 +849,97 @@ float4 CombineFs(CombineFsInput i) : SV_Target
 	{
 		return float4(sceneColor + vxgiColor, 1.f);
 	}
-	
+}
+
+//********************************************************************************************************************************************************************
+// Debug.
+//********************************************************************************************************************************************************************
+
+struct VoxelizationDebugVsInput
+{
+	float3 vertex : POSITION;
+	float2 uv : TEXCOORD0; // 0-1
+};
+
+struct VoxelizationDebugFsInput
+{
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VoxelizationDebugFsInput VoxelizationDebugVs(VoxelizationVsInput v)
+{
+	VoxelizationDebugFsInput o;
+	o.pos = UnityClipToClipPos(v.vertex);
+	o.uv = v.uv;
+	return o;
+}
+
+float4 VoxelizationDebugFs(VoxelizationDebugFsInput fsIn) : SV_Target
+{
+	float4 accumulatedColor = float4(0.f, 0.f, 0.f, 0.f);
+	float fov = tan(CameraFielfOfView * 3.1415926f / 360.f);
+	float3 rayDirView = float3(fov * CameraAspect * (fsIn.uv.x * 2.0f - 1.0f), fov *  (fsIn.uv.y * 2.0f - 1.0f), -1.f);
+	float3 rayDirW = normalize(mul((float3x3)CameraInvView, normalize(rayDirView)));
+
+	// float4 posV = mul(CameraInvViewProj, rayPosH)
+
+	int totalSamples = VoxelTextureResolution * VoxelSize / RayStepSize;
+	[loop]
+	for (int i = 0; i < totalSamples; ++i)
+	{
+		float4 rayWorld = float4(CameraPosW + rayDirW * RayStepSize * i, 1.f);
+		float3 uvwLerp = mul(WorldToVoxel, rayWorld).xyz;
+		uint3 uvw = uvwLerp; // VoxelTextureResolution;
+		uvwLerp /= VoxelTextureResolution;
+		float opacity = DecodeGbuffer(VoxelTexOpacity[uvw]).x;
+		float4 texSample = float4(0.f, 0.f, 0.f, 0.f);
+		switch (VisualizeDebugType)
+		{
+		case 0: // albedo
+			texSample = DecodeGbuffer(VoxelTexAlbedo[uvw]);
+			texSample.a = opacity;
+			break;
+		case 1: // normal
+			texSample = DecodeGbuffer(VoxelTexNormal[uvw]);
+			texSample.rgb = (texSample.rgb * 2.f) - float3(1.f, 1.f, 1.f);
+			texSample.a = opacity;
+			break;
+		case 2: // emissive
+			texSample = DecodeGbuffer(VoxelTexEmissive[uvw]);
+			texSample.rgb *= EmissiveMulti;
+			texSample.a = opacity;
+			break;
+		case 3: // lighting
+			texSample = VoxelTexLighting.SampleLevel(linear_clamp_sampler, uvwLerp, DirectLightingDebugMipLevel);
+			break;
+		case 4: // indirectlighting
+			texSample = VoxelTexIndirectLighting.SampleLevel(linear_clamp_sampler, uvwLerp, IndirectLightingDebugMipLevel);
+			break;
+		case 5: // cone trace
+			float3 traceColor = tex2D(ScreenConeTraceIrradiance, fsIn.uv).rgb;
+			return float4(traceColor, 1.f);
+		case 6: // TAA
+			float3 blendColor = tex2D(ScreenBlendIrradiance, fsIn.uv).rgb;
+			return float4(blendColor, 1.f);
+		case 7: // BilateralFiltering
+			float3 filterColor = tex2D(ScreenBilateralFiltering, fsIn.uv).rgb;
+			return float4(filterColor, 1.f);
+		default:
+			break;
+		}
+
+		if (texSample.a > 0.0001f)
+		{
+			accumulatedColor.rgb = accumulatedColor.rgb + (1.f - accumulatedColor.a) * texSample.rgb;
+			accumulatedColor.a = accumulatedColor.a + (1.f - accumulatedColor.a) * texSample.a;
+		}
+
+		if (accumulatedColor.a > 0.95f)
+		{
+			break;
+		}
+	}
+	return accumulatedColor;
 }
 

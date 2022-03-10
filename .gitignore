@@ -67,6 +67,3 @@ crashlytics-build.properties
 *.unity
 *.fbx
 *.obj
-
-/Materials
-/Scenes
