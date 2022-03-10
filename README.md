@@ -2,8 +2,8 @@
 
 Sample Scene without VXGI
 
-![NoVXGI](\Img\NoVXGI.png)
+![NoVXGI](https://github.com/BonheurTing/VoxelGI/Img/NoVXGI.png)
 
 Sample Scene with VXGI
 
-![VXGI](\Img\VXGI.png)
+![VXGI](https://github.com/BonheurTing/VoxelGI/Img/VXGI.png)
