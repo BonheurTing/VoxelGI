@@ -913,10 +913,7 @@ public class VoxelGI : MonoBehaviour
             if (objRenderer == null)
                 continue;
 
-            if (objRenderer.sharedMaterial.name == "VXGI/Blocker" ||
-                objRenderer.sharedMaterial.name == "Blocker" ||
-                objRenderer.sharedMaterial.name == "Blocker (Instance)" ||
-                objRenderer.sharedMaterial.name == "Blocker (Instance) (Instance)")
+            if (objRenderer.sharedMaterial.name.Substring(0, 7) == "Blocker")
             {
                 continue;
             }
