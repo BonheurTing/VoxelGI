@@ -619,6 +619,27 @@ public class VoxelGI : MonoBehaviour
             RenderTextureFormat.ARGBHalf
          );
 
+        RTSceneColor = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+            );
+
+        RTConeTracing = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+            );
+
+        ConeTracingRT = RenderTexture.GetTemporary(
+            RenderCamera.pixelWidth,
+            RenderCamera.pixelHeight,
+            0,
+            RenderTextureFormat.ARGBHalf
+            );
+
         DummyTex = new RenderTexture(DummyDesc);
         DummyTex.Create();
 
@@ -658,6 +679,9 @@ public class VoxelGI : MonoBehaviour
 
         RenderTexture.ReleaseTemporary(ScreenIrradianceRT0);
         RenderTexture.ReleaseTemporary(ScreenIrradianceRT1);
+        RenderTexture.ReleaseTemporary(RTSceneColor);
+        RenderTexture.ReleaseTemporary(RTConeTracing);
+        RenderTexture.ReleaseTemporary(ConeTracingRT);
 
         DummyTex.DiscardContents();
         DummyTex.Release();
@@ -795,24 +819,6 @@ public class VoxelGI : MonoBehaviour
 
     void BeginRender()
     {
-        RTSceneColor = RenderTexture.GetTemporary(
-            RenderCamera.pixelWidth,
-            RenderCamera.pixelHeight,
-            0,
-            RenderTextureFormat.ARGBHalf
-            );
-        RTConeTracing = RenderTexture.GetTemporary(
-            RenderCamera.pixelWidth,
-            RenderCamera.pixelHeight,
-            0,
-            RenderTextureFormat.ARGBHalf
-            );
-        ConeTracingRT = RenderTexture.GetTemporary(
-            RenderCamera.pixelWidth,
-            RenderCamera.pixelHeight,
-            0,
-            RenderTextureFormat.ARGBHalf
-            );
         CommandBuffer.Clear();
 
         CommandBuffer.SetGlobalVector(Shader.PropertyToID("CameraPosW"), RenderCamera.transform.position);
@@ -824,7 +830,7 @@ public class VoxelGI : MonoBehaviour
         CommandBuffer.SetGlobalMatrix(Shader.PropertyToID("CameraInvViewProj"), renderCameraVP.inverse);
         CommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraFielfOfView"), RenderCamera.fieldOfView);
         CommandBuffer.SetGlobalFloat(Shader.PropertyToID("CameraAspect"), RenderCamera.aspect);
-        CommandBuffer.SetGlobalInt(Shader.PropertyToID("VoxelizationConfig.VoxelTextureResolution"), VoxelizationConfig.VoxelTextureResolution);
+        CommandBuffer.SetGlobalInt(Shader.PropertyToID("VoxelTextureResolution"), VoxelizationConfig.VoxelTextureResolution);
 
         if (NeedToClearHistory)
         {
@@ -907,9 +913,10 @@ public class VoxelGI : MonoBehaviour
             if (objRenderer == null)
                 continue;
 
-            if (objRenderer.material.name == "VXGI/Blocker" ||
-                objRenderer.material.name == "Blocker" ||
-                objRenderer.material.name == "Blocker (Instance)")
+            if (objRenderer.sharedMaterial.name == "VXGI/Blocker" ||
+                objRenderer.sharedMaterial.name == "Blocker" ||
+                objRenderer.sharedMaterial.name == "Blocker (Instance)" ||
+                objRenderer.sharedMaterial.name == "Blocker (Instance) (Instance)")
             {
                 continue;
             }
@@ -940,10 +947,10 @@ public class VoxelGI : MonoBehaviour
         CommandBuffer.SetComputeTextureParam(VXGIComputeShader, ComputeKernelIdDirectLighting, Shader.PropertyToID("ShadowDepth"), ShadowDepth);
         CommandBuffer.SetComputeTextureParam(VXGIComputeShader, ComputeKernelIdDirectLighting, Shader.PropertyToID("OutRadiance"), UavLighting);
 
-        CommandBuffer.SetComputeMatrixParam(VXGIComputeShader, "gVoxelToWorld", voxelToWorld);
-        CommandBuffer.SetComputeMatrixParam(VXGIComputeShader, "gWorldToVoxel", worldToVoxel);
-        CommandBuffer.SetComputeFloatParam(VXGIComputeShader, "gVoxelTextureResolution", VoxelizationConfig.VoxelTextureResolution);
-        CommandBuffer.SetComputeFloatParam(VXGIComputeShader, "gVoxelSize", VoxelizationConfig.VoxelSize);
+        CommandBuffer.SetComputeMatrixParam(VXGIComputeShader, "VoxelToWorld", voxelToWorld);
+        CommandBuffer.SetComputeMatrixParam(VXGIComputeShader, "WorldToVoxel", worldToVoxel);
+        CommandBuffer.SetComputeFloatParam(VXGIComputeShader, "VoxelTextureResolution", VoxelizationConfig.VoxelTextureResolution);
+        CommandBuffer.SetComputeFloatParam(VXGIComputeShader, "VoxelSize", VoxelizationConfig.VoxelSize);
 
         Debug.Assert(
             (DirectLightingConfig.SunLight.type == LightType.Directional)
@@ -1248,9 +1255,6 @@ public class VoxelGI : MonoBehaviour
 
     void EndRender()
     {
-        RenderTexture.ReleaseTemporary(RTSceneColor);
-        RenderTexture.ReleaseTemporary(RTConeTracing);
-        RenderTexture.ReleaseTemporary(ConeTracingRT);
     }
 
     #endregion

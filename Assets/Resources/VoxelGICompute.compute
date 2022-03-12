@@ -2,7 +2,7 @@
 
 #include "UnityCG.cginc"
 
-//#pragma enable_d3d11_debug_symbols
+#pragma enable_d3d11_debug_symbols
 #pragma kernel VoxelDirectLighting
 #pragma kernel MipmapGeneration
 #pragma kernel CopyTexture3D
@@ -19,10 +19,10 @@ Texture3D<uint> RWOpacity;
 
 sampler2D ShadowDepth;
 
-float4x4 gVoxelToWorld;
-float4x4 gWorldToVoxel;
-float gVoxelTextureResolution;
-float gVoxelSize;
+float4x4 VoxelToWorld;
+float4x4 WorldToVoxel;
+float VoxelTextureResolution;
+float VoxelSize;
 
 //********************************************************************************************************************************************************************
 // Util.
@@ -344,7 +344,7 @@ RWTexture3D<half4> OutRadiance;
 void VoxelDirectLighting(uint3 id : SV_DispatchThreadID)
 {
 	float3 voxelPos = float3(id)+float3(0.5f, 0.5f, 0.5f);
-	float3 worldPos = mul(gVoxelToWorld, float4(voxelPos, 1.0f)).xyz;
+	float3 worldPos = mul(VoxelToWorld, float4(voxelPos, 1.0f)).xyz;
 	float3 voxelIrradiance = 0.f;
 
 	float3 albedo = DecodeGbuffer(RWAlbedo[id.xyz]).xyz;
@@ -356,10 +356,10 @@ void VoxelDirectLighting(uint3 id : SV_DispatchThreadID)
 
 	// shadow
 #if ENABLE_SHADOW_NORMAL_BIAS
-	float3 shadowWorldPos = worldPos + normal * 0.5f * ShadowNormalBias * gVoxelSize;
+	float3 shadowWorldPos = worldPos + normal * 0.5f * ShadowNormalBias * VoxelSize;
 	float4 shadowPos = mul(gWorldToShadowVP, float4(shadowWorldPos, 1.0f));
 #elif ENABLE_SHADOW_SUN_BIAS
-	float3 shadowWorldPos = worldPos - normalize(SunLightDir) * 0.5f * ShadowSunBias * gVoxelSize;
+	float3 shadowWorldPos = worldPos - normalize(SunLightDir) * 0.5f * ShadowSunBias * VoxelSize;
 	float4 shadowPos = mul(gWorldToShadowVP, float4(shadowWorldPos, 1.0f));
 #else
 	float4 shadowPos = mul(gWorldToShadowVP, float4(worldPos, 1.f));
@@ -441,13 +441,13 @@ float3 SquareToUniformHemisphere(float2 input)
 
 float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 {
-	if (TextureSDF(voxelPos / gVoxelTextureResolution) < 0.0)
+	if (TextureSDF(voxelPos / VoxelTextureResolution) < 0.0)
 	{
 		return float3(0.f, 0.f, 0.f);
 	}
 
 	normal = normalize(normal);
-	float3 origin = voxelPos / gVoxelTextureResolution;
+	float3 origin = voxelPos / VoxelTextureResolution;
 
 	float3x3 TangentBasis = GetTangentBasis(normal);
 	float coneTan = tan(IndirectLightingConeAngle * 3.14159265f / 360.f);
@@ -459,7 +459,7 @@ float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 	for (coneIndex = 0; coneIndex < CONE_COUNT; ++coneIndex)
 	{
 		coneColor = float4(0.f, 0.f, 0.f, 0.f);
-		step = IndirectLightingFirstStep / gVoxelTextureResolution;
+		step = IndirectLightingFirstStep / VoxelTextureResolution;
 		offset = step;
 		sampleRadius = offset * coneTan;
 		coneDir = Fibonacci_Lattice_Hemisphere[coneIndex];
@@ -470,7 +470,7 @@ float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 		[loop]
 		while (coneColor.a < 0.95f && TextureSDF(coordinate) > 0.0f && stepNum <= IndirectLightingMaxStepNum)
 		{
-			float mip = clamp(CalcMipLevel(sampleRadius * gVoxelTextureResolution), IndirectLightingMinMipLevel, IndirectLightingMaxMipLevel);
+			float mip = clamp(CalcMipLevel(sampleRadius * VoxelTextureResolution), IndirectLightingMinMipLevel, IndirectLightingMaxMipLevel);
 			float4 sampledRadiance = VoxelLighting.SampleLevel(linear_clamp_sampler, coordinate, mip);
 			coneColor += (1.f - pow(coneColor.a, IndirectLightingAlphaAtten)) *  sampledRadiance;
 
@@ -492,7 +492,7 @@ float3 CalculateIndirectIrradiance(float3 voxelPos, float3 normal)
 void VoxelIndirectLighting(uint3 id : SV_DispatchThreadID)
 {
 	float3 voxelPos = float3(id)+float3(0.5f, 0.5f, 0.5f);
-	float3 worldPos = mul(gVoxelToWorld, float4(voxelPos, 1.0f)).xyz;
+	float3 worldPos = mul(VoxelToWorld, float4(voxelPos, 1.0f)).xyz;
 	float3 voxelIrradiance = 0.f;
 
 	float3 albedo = DecodeGbuffer(RWAlbedo[id.xyz]).xyz;

@@ -185,17 +185,10 @@ float4 DecodeEmissive(uint value)
 	return res;
 }
 
-void MovingAverage(uniform RWTexture3D<uint> outUav, int3 uvw, float4 val, int codeType)
+void MovingAverage(uniform RWTexture3D<uint> outUav, int3 uvw, float4 val)
 {
 	uint newVal = 0;
-	if (codeType == 2)
-	{
-		newVal = EncodeEmissive(val);
-	}
-	else
-	{
-		newVal = EncodeGbuffer(val);
-	}
+	newVal = EncodeGbuffer(val);
 	uint prevStoredVal = 0xFFFFFFFF;
 	uint curStoredVal;
 	// Loop as long as destination value gets changed by other threads
@@ -205,29 +198,14 @@ void MovingAverage(uniform RWTexture3D<uint> outUav, int3 uvw, float4 val, int c
 	{
 		prevStoredVal = curStoredVal;
 		float4 gbuffer = float4(0.f, 0.f, 0.f, 0.f);
-		if (codeType == 2)
-		{
-			gbuffer = DecodeEmissive(curStoredVal);
-		}
-		else
-		{
-			gbuffer = DecodeGbuffer(curStoredVal);
-		}
+		gbuffer = DecodeGbuffer(curStoredVal);
 		gbuffer.w *= MOVING_AVERAGE_MAX;
 		gbuffer.xyz = (gbuffer.xyz * gbuffer.w); // Denormalize
 		float4 curValF = gbuffer + val; // Add new value
 		curValF.xyz /= max(curValF.w, 0.001f); // Renormalize
 		curValF.w /= MOVING_AVERAGE_MAX;
 		curValF.w += 0.001f;
-
-		if (codeType == 2)
-		{
-			newVal = EncodeEmissive(curValF);
-		}
-		else
-		{
-			newVal = EncodeGbuffer(curValF);
-		}
+		newVal = EncodeGbuffer(curValF);
 		InterlockedCompareExchange(outUav[uvw], prevStoredVal, newVal, curStoredVal);
 	}
 }
@@ -534,10 +512,10 @@ half4 VoxelizationFs(VoxelizationFsInput i) : SV_Target
 	int3 uvw = int3(posV.xyz);
 
 	// store the fragment in our 3d texture using a moving average
-	MovingAverage(OutAlbedo, uvw, albedo, 0);
-	MovingAverage(OutNormal, uvw, normalA, 1);
-	MovingAverage(OutEmissive, uvw, emissive, 0);
-	MovingAverage(OutOpacity, uvw, opacity, 3);
+	MovingAverage(OutAlbedo, uvw, albedo);
+	MovingAverage(OutNormal, uvw, normalA);
+	MovingAverage(OutEmissive, uvw, emissive);
+	MovingAverage(OutOpacity, uvw, opacity);
 
 	return half4(1.f, 0.f, 0.f, 1.0f);
 }
@@ -743,10 +721,10 @@ float4 ConeTracingFs(ConeTracingFsInput i) : SV_Target
 	{
 		screenIrradiance = CalculateScreenIrradiance(float4(voxelPos, 1.f), N);
 	}
-	//return float4(screenIrradiance, 1.f);
 	float3 albedo = tex2D(ScreenAlbedo, i.uv).xyz;
 	float3 traceColor = screenIrradiance * albedo * ScreenScale;
-	
+
+	//traceColor = voxelPos;
     return float4(traceColor, 1.f);
 }
 

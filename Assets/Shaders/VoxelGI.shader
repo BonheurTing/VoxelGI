@@ -18,6 +18,7 @@
 			ZTest Off
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma require geometry
 				#pragma target 5.0
 				#pragma vertex VoxelizationVs
@@ -35,6 +36,7 @@
 			ZTest GEqual
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma target 5.0
 				#pragma vertex ShadowVs
 				#pragma fragment ShadowFs
@@ -50,6 +52,7 @@
 			ZTest Off
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma target 5.0
 				#pragma vertex ConeTracingVs
 				#pragma fragment ConeTracingFs
@@ -65,6 +68,7 @@
 			ZTest Off
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma target 5.0
 				#pragma vertex TemporalFilterVs
 				#pragma fragment TemporalFilterFs
@@ -80,6 +84,7 @@
 			ZTest Off
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma target 5.0
 				#pragma vertex CombineVs
 				#pragma fragment CombineFs
@@ -95,6 +100,7 @@
 			ZTest Off
 
 			CGPROGRAM
+				#pragma enable_d3d11_debug_symbols
 				#pragma target 5.0
 				#pragma vertex VoxelizationDebugVs
 				#pragma fragment VoxelizationDebugFs
